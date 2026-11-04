@@ -1,0 +1,28 @@
+name: Deploy API (Cloudflare Worker + R2)
+
+on:
+  push:
+    branches: [main]
+    paths: ['worker/**', 'web/js/masters.js', 'web/js/catalog.js', '.github/workflows/deploy-worker.yml']
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci || npm install
+        working-directory: worker
+      - uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: worker
+          secrets: |
+            SURVEY_KEY
+            ADMIN_KEY
+        env:
+          SURVEY_KEY: ${{ secrets.SURVEY_KEY }}
+          ADMIN_KEY: ${{ secrets.ADMIN_KEY }}
