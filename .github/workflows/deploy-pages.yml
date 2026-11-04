@@ -3,7 +3,6 @@ name: Deploy web app to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: ['web/**', '.github/workflows/deploy-pages.yml']
   workflow_dispatch:
 
 permissions:
@@ -11,21 +10,25 @@ permissions:
   pages: write
   id-token: write
 
-concurrency: { group: pages, cancel-in-progress: true }
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    environment: { name: github-pages, url: '${{ steps.deployment.outputs.page_url }}' }
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - name: Inject Worker URL (repository variable API_BASE)
-        if: ${{ vars.API_BASE != '' }}
-        run: sed -i "s#API_BASE: ''#API_BASE: '${{ vars.API_BASE }}'#" web/js/config.js
-      - name: Stamp service-worker cache version
-        run: sed -i "s#const VERSION = 'v1'#const VERSION = '${GITHUB_SHA::8}'#" web/sw.js
+      - name: Inject Worker URL
+        env:
+          API_BASE: ${{ vars.API_BASE }}
+        run: |
+          sed -i "s#API_BASE: ''#API_BASE: '${API_BASE}'#" web/js/config.js
+      - name: Stamp service-worker version
+        run: |
+          sed -i "s#const VERSION = 'v1'#const VERSION = '${GITHUB_SHA::8}'#" web/sw.js
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
-        with: { path: web }
+        with:
+          path: web
       - id: deployment
         uses: actions/deploy-pages@v4
