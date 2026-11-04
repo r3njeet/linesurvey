@@ -10,8 +10,9 @@
  * so simultaneous submissions from many surveyors never overwrite each other.
  *
  * Secrets / vars (see wrangler.toml & README):
- *   SURVEY_KEY       access key for surveyors (submit, view, report)
- *   ADMIN_KEY        access key for admins (also delete + rebuild index)
+ *   (no key)         anyone with the link can submit surveys AND view dashboard / reports / photos
+ *   ADMIN_KEY        admin key: the only one allowed to DELETE surveys or rebuild the index
+ *   SURVEY_KEY       no longer needed (kept only for backward compatibility)
  *   ALLOWED_ORIGINS  comma separated origins allowed by CORS, or "*"
  */
 import { HIERARCHY } from '../../web/js/masters.js';
@@ -44,20 +45,18 @@ async function route(request, env) {
 
   const role = authRole(request, url, env);
 
-  if (p === '/api/auth' && m === 'GET') {
-    if (!role) throw httpError(401, 'Invalid access key');
-    return json({ ok: true, role });
-  }
+  const given = request.headers.get('X-Access-Key') || url.searchParams.get('k') || '';
+  if (given && !role) throw httpError(401, 'Invalid access key');   // a wrong key is always an error
 
-  if (!role) throw httpError(401, 'Invalid or missing access key');
+  // Open to everyone with the link: submit, list, view photos.
+  if (p === '/api/auth' && m === 'GET') return json({ ok: true, role: role || 'public' });
+  if (p === '/api/surveys' && m === 'POST') return submitSurvey(request, env);
 
   if (p === '/api/surveys' && m === 'GET') {
     const obj = await env.BUCKET.get(INDEX_KEY);
     const list = obj ? await obj.json() : await buildIndexFromRecords(env);
     return json({ ok: true, surveys: list }, 200, { 'Cache-Control': 'no-store' });
   }
-
-  if (p === '/api/surveys' && m === 'POST') return submitSurvey(request, env);
 
   if (p === '/api/photo' && m === 'GET') {
     const key = url.searchParams.get('key') || '';
@@ -71,12 +70,12 @@ async function route(request, env) {
 
   const del = p.match(/^\/api\/surveys\/([A-Za-z0-9-]{8,64})$/);
   if (del && m === 'DELETE') {
-    if (role !== 'admin') throw httpError(403, 'Admin key required');
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
     return deleteSurvey(del[1], env);
   }
 
   if (p === '/api/admin/rebuild-index' && m === 'POST') {
-    if (role !== 'admin') throw httpError(403, 'Admin key required');
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
     const list = await buildIndexFromRecords(env);
     await env.BUCKET.put(INDEX_KEY, JSON.stringify(list), { httpMetadata: { contentType: 'application/json' } });
     return json({ ok: true, count: list.length });
@@ -143,7 +142,7 @@ function sanitize(s, photos, now) {
     id: s.id,
     createdAt: now.toISOString(),
     capturedAt: str(s.capturedAt, 40) || now.toISOString(),
-    surveyor: { name: str(s.surveyor?.name, 100), mobile: str(s.surveyor?.mobile, 20) },
+    surveyor: { name: str(s.surveyor?.name, 100) },
     subdivision: s.subdivision, substation: s.substation, feeder: s.feeder,
     irregularities: s.irregularities.map(i => ({ code: i.code, voltage: i.voltage || null, text: i.text ? str(i.text, 300) : undefined })),
     photos,
