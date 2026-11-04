@@ -16,7 +16,7 @@ export function saveSettings(s) {
 }
 export const apiBase = () => (getSettings().apiBase || CONFIG.API_BASE || '').trim().replace(/\/+$/, '');
 export const isDemo = () => !apiBase();
-export const role = () => (isDemo() ? 'admin' : getSettings().role || 'surveyor');
+export const role = () => (isDemo() ? 'admin' : getSettings().role || 'public');
 
 async function req(path, opts = {}, base = apiBase(), key = getSettings().key) {
   let res;
