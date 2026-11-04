@@ -103,7 +103,7 @@ async function openDetail(s) {
         <dt>Location</dt><dd>${esc(s.location)}</dd>
         <dt>Landmark</dt><dd>${esc(s.landmark)}</dd>
         <dt>GPS</dt><dd><a href="https://www.google.com/maps?q=${s.gps.lat},${s.gps.lng}" target="_blank" rel="noopener">${fmtLatLng(s.gps)}</a> ±${Math.round(s.gps.acc || 0)} m</dd>
-        <dt>Surveyor</dt><dd>${esc(s.surveyor?.name)} ${s.surveyor?.mobile ? '· ' + esc(s.surveyor.mobile) : ''}</dd>
+        <dt>Surveyor</dt><dd>${esc(s.surveyor?.name)}</dd>
         ${s.remarks ? `<dt>Remarks</dt><dd>${esc(s.remarks)}</dd>` : ''}
       </dl>
       <h3>Irregularities</h3>
@@ -140,13 +140,13 @@ function exportCSV() {
   if (!view.length) { toast('Nothing to export', 'err'); return; }
   const rows = view.filter(s => !selected.size || selected.has(s.id));
   const head = ['Ref', 'Survey ID', 'Captured At', 'Submitted At', 'Subdivision', 'Substation', 'Feeder', 'Irregularities',
-    'Location', 'Landmark', 'Remarks', 'Latitude', 'Longitude', 'GPS Accuracy (m)', 'Surveyor', 'Mobile', 'Material Required',
+    'Location', 'Landmark', 'Remarks', 'Latitude', 'Longitude', 'GPS Accuracy (m)', 'Surveyor', 'Material Required',
     ...MATERIALS.map(m => `${m.item} (${m.unit === 'm' ? 'm' : 'Nos'})`), 'Photos', 'Google Maps'];
   const lines = [head, ...rows.map(s => {
     const q = Object.fromEntries((s.materials || []).map(m => [m.id, m.qty]));
     return [s.ref, s.id, fmtDateTime(s.capturedAt), fmtDateTime(s.createdAt), s.subdivision, s.substation, s.feeder,
       s.irregularities.map(irregularityName).join('; '), s.location, s.landmark, s.remarks || '',
-      s.gps?.lat, s.gps?.lng, Math.round(s.gps?.acc || 0), s.surveyor?.name, s.surveyor?.mobile, s.materialRequired ? 'Yes' : 'No',
+      s.gps?.lat, s.gps?.lng, Math.round(s.gps?.acc || 0), s.surveyor?.name, s.materialRequired ? 'Yes' : 'No',
       ...MATERIALS.map(m => q[m.id] || ''), s.photos.length, `https://www.google.com/maps?q=${s.gps?.lat},${s.gps?.lng}`];
   })];
   const csv = lines.map(r => r.map(v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; }).join(',')).join('\r\n');
@@ -224,7 +224,7 @@ async function drawPage(doc, s, pageNo, pageCount) {
   };
   const row1 = (l, v) => { const a = cell(M, y, CW, l, v); a.draw(a.h); y += a.h; };
   row2('Subdivision', s.subdivision, 'Substation', displayName(s.substation));
-  row2('Feeder', displayName(s.feeder), 'Surveyed by', `${s.surveyor?.name || ''}${s.surveyor?.mobile ? '  (' + s.surveyor.mobile + ')' : ''}`);
+  row2('Feeder', displayName(s.feeder), 'Surveyed by', s.surveyor?.name);
   row1('Location', s.location);
   row2('Landmark', s.landmark, 'GPS (lat, long)', `${fmtLatLng(s.gps)}  ±${Math.round(s.gps?.acc || 0)} m`);
   // map link over GPS cell
