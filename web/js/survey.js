@@ -284,7 +284,7 @@ function buildRecord() {
   return {
     id: st.id,
     capturedAt: st.photos[0]?.takenAt || new Date().toISOString(),
-    surveyor: { name: s.name || '', mobile: s.mobile || '' },
+    surveyor: { name: s.name || '' },
     subdivision: $('#sv-sd').value, substation: $('#sv-ss').value, feeder: $('#sv-fd').value,
     irregularities,
     photos: st.photos.map(p => ({ lat: p.lat, lng: p.lng, acc: p.acc, takenAt: p.takenAt })),
