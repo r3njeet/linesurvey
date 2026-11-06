@@ -42,7 +42,7 @@ geotagged photographs, material requirements, a progress dashboard, and one-page
 4. Enter **Location** and **Landmark** (Hindi is fine) plus optional remarks.
 5. **Material required?** Yes/No. If Yes, enter quantities:
    Pole (PCC 8.5/9/11 m, STP 9/11/13 m from the `POLE` sheet) in Nos, Conductor ACSR Weasel/Rabbit/Dog in metres,
-   Pin Insulator 33/11 kV in Nos, Disc Insulator 33/11 kV in Nos, LT AB Cable 1X16 / 3X50 / 3X95 / 3X120 sqmm in metres.
+   Pin Insulator 33/11 kV in Nos, Disc Insulator 33/11 kV in Nos, V Cross Arm 33/11 kV in Nos, LT AB Cable 1X16 / 3X50 / 3X95 / 3X120 sqmm in metres.
 6. **Submit.** Each survey gets a running number (`LS-00001`, …). **No network? No problem.** The survey is saved on the phone
    and uploads automatically when the connection returns (the header shows "Offline · n pending").
 
