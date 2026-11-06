@@ -43,6 +43,8 @@ export const MATERIALS = [
   { id: 'PIN_11',  cat: 'Pin Insulator',  item: 'Pin Insulator 11 kV',  unit: 'Nos' },
   { id: 'DISC_33', cat: 'Disc Insulator', item: 'Disc Insulator 33 kV', unit: 'Nos' },
   { id: 'DISC_11', cat: 'Disc Insulator', item: 'Disc Insulator 11 kV', unit: 'Nos' },
+  { id: 'VCA_33', cat: 'V Cross Arm', item: 'V Cross Arm 33 kV', unit: 'Nos' },
+  { id: 'VCA_11', cat: 'V Cross Arm', item: 'V Cross Arm 11 kV', unit: 'Nos' },
   { id: 'ABC_1X16',  cat: 'LT AB Cable', item: 'LT AB Cable 1X16 sqmm',  unit: 'm' },
   { id: 'ABC_3X50',  cat: 'LT AB Cable', item: 'LT AB Cable 3X50 sqmm',  unit: 'm' },
   { id: 'ABC_3X95',  cat: 'LT AB Cable', item: 'LT AB Cable 3X95 sqmm',  unit: 'm' },
