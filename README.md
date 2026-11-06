@@ -30,7 +30,9 @@ geotagged photographs, material requirements, a progress dashboard, and one-page
 ## Features
 
 **Survey tab**
-1. Select **Subdivision → Substation → Feeder** (from the `SUBSTATION` sheet). Photos are locked until all three are selected. The last selection is remembered, so a surveyor walking one feeder doesn't re-select it every time.
+1. First choose the line type, **11 kV line** or **33 kV line**. Photos stay locked until the line details are complete, and the last selection is remembered.
+   * **11 kV:** Subdivision → Substation → Feeder (from the `SUBSTATION` sheet).
+   * **33 kV:** Primary Substation → 33 kV Line → Section → Substation (from the `33KV` sheet). The Subdivision is filled in automatically from the chosen substation.
 2. Tick the irregularities. Items that depend on line voltage ask for 33 kV / 11 kV / LT:
    Tilted, Dilapidated, Rusted, Broken Pole · Sagged Line {33/11/LT} · House/Construction Under Line {33/11/LT} · Long Span Line ·
    Low Ground Clearance {33/11/LT} · Road/Canal/River Crossing · GI Wire Line {11/LT} · Too Many Joints In Span {33/11/LT} ·
@@ -76,8 +78,8 @@ Create a new repository (private is fine) and push this folder to the `main` bra
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | token from step 2.3 |
 | `CLOUDFLARE_ACCOUNT_ID` | account id from step 2.4 |
-| `SURVEY_KEY` | access key for surveyors (make up a strong one, e.g. 16+ characters) |
-| `ADMIN_KEY` | different, stronger key for supervisors (allows delete) |
+| `ADMIN_KEY` | key you make up (16+ characters). Only the admin who holds it can delete surveys |
+| `SURVEY_KEY` | not used any more. Surveyors need no key. You can leave it saved, it does nothing |
 
 ### 4. Deploy the API
 **Actions → "Deploy API (Cloudflare Worker + R2)" → Run workflow.** When it finishes, the log shows the Worker URL,
@@ -90,15 +92,15 @@ e.g. `https://line-survey-api.<your-subdomain>.workers.dev`. Check it by opening
 4. (Recommended) In `worker/wrangler.toml` set `ALLOWED_ORIGINS = "https://<user>.github.io"` and push, so only your app can call the API.
 
 ### 6. On each phone
-Open the Pages URL in Chrome, then use **⋮ → Add to Home screen**. On first launch, enter the surveyor's name, mobile and the
-**access key** (`SURVEY_KEY`, or `ADMIN_KEY` for supervisors), tap **Test connection**, then **Save**. Allow **Camera** and **Location** when asked.
+Open the Pages URL in Chrome, then use **⋮ → Add to Home screen**. On first launch, surveyors only enter their **name** and tap **Save**. Allow **Camera** and **Location** when asked.
+The admin additionally opens ⚙ Settings once and types the **Admin key**; this enables the Delete button in Reports.
 
 > Without a server URL the app runs in **Demo mode**, which stores everything only on that device. It's handy for training.
 
 ---
 
 ## Updating master data (substations / feeders / poles)
-Edit the Excel file (same sheet & column names), then run:
+Edit the Excel file (same sheet & column names: `SUBSTATION`, `POLE`, `33KV`), then run:
 ```bash
 pip install openpyxl
 python3 tools/xlsx_to_masters.py tools/Substation_And_Material.xlsx
@@ -115,7 +117,7 @@ Open <http://localhost:8080>, then in ⚙ Settings use server `http://127.0.0.1:
 (Geolocation and the camera need `localhost` or HTTPS.)
 
 ## API reference (Worker)
-All endpoints except `/api/health` need header `X-Access-Key: <SURVEY_KEY|ADMIN_KEY>`.
+Everything is open to anyone with the link except deleting. `DELETE /api/surveys/:id` and `/api/admin/rebuild-index` need header `X-Access-Key: <ADMIN_KEY>`.
 
 | Method | Path | Purpose |
 |---|---|---|
