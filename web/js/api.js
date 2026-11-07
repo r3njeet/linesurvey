@@ -1,8 +1,10 @@
 import { CONFIG } from './config.js';
 import { idb } from './db.js';
+import { HIERARCHY } from './masters.js';
+import { validateSurvey, validateStretch, mergeSurveyEdit, mergeStretchEdit } from './catalog.js';
 
 export const bus = new EventTarget();
-const stretchBox = idb.coll('stretchbox'), localSt = idb.coll('localst');
+const stretchBox = idb.coll('stretchbox'), localSt = idb.coll('localst'), rectBox = idb.coll('rectbox');
 const emit = (type, detail) => bus.dispatchEvent(new CustomEvent(type, { detail }));
 
 /* ---------------- settings ---------------- */
@@ -53,14 +55,21 @@ export async function queueStretch(record) {
   emit('outbox');
   sync();
 }
-export const pendingCount = async () => (await idb.count('outbox')) + (await stretchBox.count());
+export const pendingCount = async () => (await idb.count('outbox')) + (await stretchBox.count()) + (await rectBox.count());
+
+/** "Fixed on site": note + after-photos for a survey. Queued like surveys, so it also works without network. */
+export async function queueRectify(surveyId, data, photoBlobs) {
+  await rectBox.put(surveyId, { id: surveyId, data, photos: photoBlobs, queuedAt: new Date().toISOString() });
+  emit('outbox');
+  sync();
+}
 
 let syncing = false;
 export async function sync() {
   if (syncing) return;
   syncing = true;
   emit('sync', { state: 'start' });
-  let uploaded = 0, uploadedSt = 0, lastError = null;
+  let uploaded = 0, uploadedSt = 0, uploadedFix = 0, lastError = null;
   try {
     // stretches first, so a survey never reaches the server before the stretch it belongs to
     for (const st of await stretchBox.all()) {
@@ -97,11 +106,30 @@ export async function sync() {
         break; // network / auth problem — retry later
       }
     }
+    // after surveys, so the survey a fix belongs to is already on the server
+    if (!lastError) for (const it of await rectBox.all()) {
+      try {
+        if (isDemo()) await rectifyLocal(it);
+        else {
+          if (!navigator.onLine) { lastError = 'Offline'; break; }
+          const fd = new FormData();
+          fd.append('data', JSON.stringify(it.data));
+          it.photos.forEach((b, i) => fd.append(`photo_${i}`, b, `fix_${i + 1}.jpg`));
+          await req(`/api/surveys/${encodeURIComponent(it.id)}/rectify`, { method: 'POST', body: fd });
+        }
+        await rectBox.del(it.id);
+        uploadedFix++;
+      } catch (err) {
+        lastError = err.message;
+        if (err.status === 422 || err.status === 404) { await rectBox.del(it.id); continue; }   // can never be accepted (or survey was deleted)
+        break;
+      }
+    }
   } finally {
     syncing = false;
     emit('outbox');
     emit('sync', { state: 'done', uploaded, error: lastError });
-    if (uploaded || uploadedSt) emit('data');
+    if (uploaded || uploadedSt || uploadedFix) emit('data');
   }
 }
 export async function discardOutbox(id) { await idb.del('outbox', id); emit('outbox'); }
@@ -118,6 +146,53 @@ async function saveLocal(it) {
   rec.photos = rec.photos.map((p, i) => ({ ...p, key: `demo/${rec.id}/${i + 1}.jpg` }));
   for (let i = 0; i < it.photos.length; i++) await idb.put('blobs', it.photos[i], rec.photos[i].key);
   await idb.put('local', rec);
+}
+
+async function rectifyLocal(it) {
+  const rec = await idb.get('local', it.id);
+  if (!rec || rec.rectified) return;
+  const photos = [];
+  for (let i = 0; i < it.photos.length; i++) {
+    const key = `demo/${it.id}/fix-${i + 1}.jpg`;
+    await idb.put('blobs', it.photos[i], key);
+    photos.push({ ...(it.data.photos?.[i] || {}), key });
+  }
+  rec.rectified = { at: it.data.at, by: it.data.by, note: it.data.note || '', photos };
+  await idb.put('local', rec);
+}
+
+/* ---------------- admin corrections ---------------- */
+function failIfInvalid(errors) { if (errors.length) { const e = new Error(errors.join('; ')); e.status = 422; throw e; } }
+export async function patchSurvey(id, body) {
+  if (isDemo()) {
+    const old = await idb.get('local', id); if (!old) throw new Error('Survey not found');
+    const next = mergeSurveyEdit(old, body); failIfInvalid(validateSurvey(next, HIERARCHY));
+    await idb.put('local', { ...next, editedAt: new Date().toISOString() });
+  } else {
+    await req('/api/surveys/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
+  }
+  emit('data');
+}
+export async function patchStretch(id, body) {
+  if (isDemo()) {
+    const old = await localSt.get(id); if (!old) throw new Error('Stretch not found');
+    const next = mergeStretchEdit(old, body); failIfInvalid(validateStretch(next, HIERARCHY));
+    await localSt.put(id, { ...next, editedAt: new Date().toISOString() });
+  } else {
+    await req('/api/stretches/' + encodeURIComponent(id), { method: 'PATCH', body: JSON.stringify(body), headers: { 'Content-Type': 'application/json' } });
+  }
+  emit('data');
+}
+/** Admin: the work was not really done, open the survey again. */
+export async function unrectify(id) {
+  if (isDemo()) {
+    const rec = await idb.get('local', id);
+    for (const p of rec?.rectified?.photos || []) await idb.del('blobs', p.key);
+    if (rec) { delete rec.rectified; await idb.put('local', rec); }
+  } else {
+    await req(`/api/surveys/${encodeURIComponent(id)}/rectify`, { method: 'DELETE' });
+  }
+  emit('data');
 }
 
 async function saveLocalStretch(rec) {
@@ -192,7 +267,7 @@ export async function getPhotoBlob(key) {
 export async function deleteSurvey(id) {
   if (isDemo()) {
     const rec = await idb.get('local', id);
-    for (const p of rec?.photos || []) await idb.del('blobs', p.key);
+    for (const p of [...(rec?.photos || []), ...(rec?.rectified?.photos || [])]) await idb.del('blobs', p.key);
     await idb.del('local', id);
   } else {
     await req('/api/surveys/' + encodeURIComponent(id), { method: 'DELETE' });

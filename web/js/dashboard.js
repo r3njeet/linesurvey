@@ -1,10 +1,11 @@
 import { HIERARCHY, LINES33 } from './masters.js';
 import { IRREGULARITIES, MATERIALS, MATERIAL_CATS, irregularityName, lineVoltageOf, lineTitle, subdivisionOfSubstation } from './catalog.js';
-import { $, esc, fmtNum, dayKey, fmtDate, shortName } from './util.js';
-import { listSurveys, bus } from './api.js';
-import { filterBarHTML, wireFilterBar, applyFilters } from './filters.js';
+import { $, esc, fmtNum, dayKey, fmtDate, fmtDateTime, shortName } from './util.js';
+import { listSurveys, listStretches, bus } from './api.js';
+import { filterBarHTML, wireFilterBar, applyFilters, filterStretches } from './filters.js';
+import { stretchKm } from './pdf-stretch.js';
 
-let root, getF, all = [], map, layer, meta = {};
+let root, getF, all = [], stretches = [], map, layer, meta = {};
 
 export function initDashboard(el) {
   root = el;
@@ -23,6 +24,7 @@ export async function showDashboard() { await load(false); }
 async function load(fresh) {
   try {
     const r = await listSurveys({ fresh });
+    stretches = await listStretches({ fresh });
     all = r.surveys; meta = r;
     render();
   } catch (err) {
@@ -39,7 +41,9 @@ function render() {
   // ---- aggregates
   const today = dayKey(new Date().toISOString());
   const findings = list.reduce((n, s) => n + s.irregularities.length, 0);
-  const withMat = list.filter(s => s.materialRequired).length;
+  const openList = list.filter(s => !s.rectified);                 // still to be fixed
+  const rectified = list.length - openList.length;
+  const withMat = openList.filter(s => s.materialRequired).length; // material is only needed where work is still pending
   const todayN = list.filter(s => dayKey(s.capturedAt || s.createdAt) === today).length;
 
   // feeders in scope
@@ -86,7 +90,7 @@ function render() {
   // materials
   const mat = MATERIALS.map(m => {
     let qty = 0, locs = 0;
-    for (const s of list) {
+    for (const s of openList) {
       const x = (s.materials || []).find(y => y.id === m.id);
       if (x) { qty += x.qty; locs++; }
     }
@@ -131,11 +135,20 @@ function render() {
   for (const s of list) { const n = s.surveyor?.name || '—'; surv[n] = (surv[n] || 0) + 1; }
   const survList = Object.entries(surv).sort((a, b) => b[1] - a[1]).slice(0, 10);
 
+  // survey stretches (same line / date filters)
+  const sl = filterStretches(stretches, f).sort((a, b) => (b.seq || 0) - (a.seq || 0));
+  const doneSt = sl.filter(x => x.end), openSt = sl.length - doneSt.length;
+  const kmTotal = doneSt.reduce((n, x) => n + stretchKm(x), 0);
+  const perSt = {};
+  for (const s of list) if (s.stretchId) { const o = (perSt[s.stretchId] ||= { n: 0, f: 0 }); o.n++; o.f += s.irregularities.length; }
+
   $('#db-body').innerHTML = `
     <div class="kpis">
       ${kpi('Surveys', list.length, `11 kV: ${n11} · 33 kV: ${n33}` + (todayN ? ` · +${todayN} today` : ''))}
       ${kpi('Irregularities found', findings, list.length ? `${(findings / list.length).toFixed(1)} per survey` : '')}
-      ${kpi('Locations needing material', withMat, list.length ? `${Math.round(withMat * 100 / list.length)}% of surveys` : '')}
+      ${kpi('Rectified', `${rectified}<small>/${list.length}</small>`, `${openList.length} still open`, list.length ? rectified / list.length : 0)}
+      ${kpi('Locations needing material', withMat, openList.length ? `${Math.round(withMat * 100 / openList.length)}% of open locations` : 'all rectified')}
+      ${kpi('Survey stretches', `${doneSt.length}<small> done</small>`, `${openSt} open` + (doneSt.length ? ` · ≈ ${kmTotal.toFixed(1)} km start to end` : ''))}
       ${kpi('Lines covered', `${unitsCovered}<small>/${unitsTotal}</small>`, [scopeFeeders.length ? `11 kV feeders ${covered}/${scopeFeeders.length}` : '', sections.length ? `33 kV sections ${coveredSections}/${sections.length}` : ''].filter(Boolean).join(' · ') || 'no lines in scope', unitsCovered / Math.max(1, unitsTotal))}
     </div>
 
@@ -151,7 +164,7 @@ function render() {
       </section>
 
       <section class="card">
-        <h3>Material required <small class="muted">${withMat} location${withMat === 1 ? '' : 's'}</small></h3>
+        <h3>Material required <small class="muted">${withMat} open location${withMat === 1 ? '' : 's'} (rectified ones not counted)</small></h3>
         <table class="tbl mat-tbl"><thead><tr><th>Item</th><th class="r">Quantity</th><th class="r">Locations</th></tr></thead>
         <tbody>${MATERIAL_CATS.map(cat => `
           <tr class="grp"><td colspan="3">${esc(cat)}</td></tr>
@@ -168,6 +181,16 @@ function render() {
             <span class="vb-x">${x.k.slice(8)}</span></div>`).join('')}</div>
           <div class="axis-note muted">Day of month · peak ${maxDay} surveys/day</div>` : '<div class="empty">No data in range</div>'}
       </section>
+
+      ${sl.length ? `<section class="card wide">
+        <h3>Survey stretches <small class="muted">${doneSt.length} completed · ${openSt} open · latest ${Math.min(12, sl.length)} shown, all in the Report tab</small></h3>
+        <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Ref</th><th>Line</th><th>Start → End</th><th>Surveyor</th><th>Started</th><th class="r">Surveys</th><th class="r">Findings</th><th class="r">≈ km</th><th>Status</th></tr></thead>
+        <tbody>${sl.slice(0, 12).map(x => { const o = perSt[x.id] || { n: 0, f: 0 }, km = stretchKm(x); return `<tr>
+          <td>${esc(x.ref)}</td><td>${lineVoltageOf(x) === '33 kV' ? '33 kV · ' : ''}${esc(lineTitle(x))}</td>
+          <td>${esc(x.start.location)} → ${x.end ? esc(x.end.location) : '<span class="muted">…</span>'}</td><td>${esc(x.surveyor?.name || '')}</td><td>${fmtDateTime(x.start.at)}</td>
+          <td class="r num">${o.n}</td><td class="r num">${o.f}</td><td class="r num">${km == null ? '' : km.toFixed(1)}</td>
+          <td>${x.end ? 'Completed' : '<b>Open</b>'}</td></tr>`; }).join('')}</tbody></table></div>
+      </section>` : ''}
 
       ${sections.length ? `<section class="card wide">
         <h3>33 kV line progress <small class="muted">${coveredSections} of ${sections.length} sections surveyed</small></h3>
@@ -216,13 +239,13 @@ function drawMap(list) {
     if (!s.gps || s.gps.lat == null) continue;
     L.circleMarker([s.gps.lat, s.gps.lng], {
       radius: 7, weight: 2, color: '#fff', fillOpacity: 0.95,
-      fillColor: s.materialRequired ? '#c2410c' : '#1d4ed8',
+      fillColor: s.rectified ? '#17803d' : s.materialRequired ? '#c2410c' : '#1d4ed8',
     }).bindPopup(`<b>${esc(s.ref || '')}</b><br>${esc(lineTitle(s))}${lineVoltageOf(s) === '33 kV' ? ' (33 kV)' : ''}<br>${s.irregularities.map(i => esc(irregularityName(i))).join('<br>')}<br><i>${esc(s.landmark)}</i>`).addTo(layer);
   }
   if (layer.getLayers().length) map.fitBounds(layer.getBounds().pad(0.2), { maxZoom: 15 });
   else map.setView([27.95, 80.4], 9);
   const legend = L.control({ position: 'bottomleft' });
-  legend.onAdd = () => { const d = L.DomUtil.create('div', 'map-legend'); d.innerHTML = '<span><i style="background:#c2410c"></i>Material required</span><span><i style="background:#1d4ed8"></i>No material</span>'; return d; };
+  legend.onAdd = () => { const d = L.DomUtil.create('div', 'map-legend'); d.innerHTML = '<span><i style="background:#c2410c"></i>Material required</span><span><i style="background:#1d4ed8"></i>No material</span><span><i style="background:#17803d"></i>Rectified</span>'; return d; };
   legend.addTo(map);
   setTimeout(() => map.invalidateSize(), 50);
 }

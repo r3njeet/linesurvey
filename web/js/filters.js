@@ -15,6 +15,7 @@ export function filterBarHTML(prefix, { extra = false } = {}) {
     ${extra ? `
     <label class="fld sm">Irregularity<select data-f="irr">${optionList(IRREGULARITIES.map(i => i.code), 'All', c => IRREGULARITIES.find(i => i.code === c).label)}</select></label>
     <label class="fld sm">Material<select data-f="mat"><option value="">All</option><option value="yes">Required</option><option value="no">Not required</option></select></label>
+    <label class="fld sm">Status<select data-f="st"><option value="">All</option><option value="open">Open</option><option value="done">Rectified</option></select></label>
     <label class="fld sm grow">Search<input type="search" data-f="q" placeholder="Ref, location, landmark, surveyor…"></label>` : ''}
   </div>`;
 }
@@ -59,6 +60,8 @@ export function applyFilters(list, f, nameFn) {
     if (f.irr && !s.irregularities.some(i => i.code === f.irr)) return false;
     if (f.mat === 'yes' && !s.materialRequired) return false;
     if (f.mat === 'no' && s.materialRequired) return false;
+    if (f.st === 'open' && s.rectified) return false;
+    if (f.st === 'done' && !s.rectified) return false;
     if (q) {
       const hay = [s.ref, s.location, s.landmark, s.remarks, s.surveyor?.name, s.feeder, s.substation, s.primarySubstation, s.line33, s.section,
         ...s.irregularities.map(nameFn)].join(' ').toLowerCase();
@@ -68,3 +71,17 @@ export function applyFilters(list, f, nameFn) {
   });
 }
 
+
+/** Same line / date filters for stretches (they have no irregularities, material or status). */
+export function filterStretches(list, f) {
+  return list.filter(x => {
+    if (f.sd && x.subdivision !== f.sd) return false;
+    if (f.ss && x.substation !== f.ss) return false;
+    if (f.lv && lineVoltageOf(x) !== f.lv) return false;
+    if (f.fd && x.feeder !== f.fd) return false;
+    const d = dayKey(x.start.at);
+    if (f.from && d < f.from) return false;
+    if (f.to && d > f.to) return false;
+    return true;
+  });
+}

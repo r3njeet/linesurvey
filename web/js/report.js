@@ -1,9 +1,12 @@
 import { CONFIG } from './config.js';
 import { MATERIALS, materialById, irregularityName, lineVoltageOf, linePath, lineTitle } from './catalog.js';
-import { $, $$, esc, toast, fmtDateTime, fmtDate, fmtLatLng, fmtNum, shortName, downloadBlob, blobToJpegDataURL, dayKey } from './util.js';
-import { listSurveys, listStretches, deleteStretch, getPhotoBlob, deleteSurvey, role, bus } from './api.js';
-import { filterBarHTML, wireFilterBar, applyFilters } from './filters.js';
+import { $, $$, esc, toast, fmtDateTime, fmtDate, fmtLatLng, fmtNum, shortName, downloadBlob, blobToJpegDataURL, dayKey, stampPhoto } from './util.js';
+import { listSurveys, listStretches, deleteStretch, getPhotoBlob, deleteSurvey, queueRectify, unrectify, getSettings, role, bus } from './api.js';
+import { filterBarHTML, wireFilterBar, applyFilters, filterStretches } from './filters.js';
+import { editSurvey, editStretch } from './editor.js';
+import { buildStretchPDF, stretchKm, surveysOf } from './pdf-stretch.js';
 import { displayName } from './survey.js';
+import { NAVY, AMBER, INK, GREY, LINE, TINT, sectionTitle, pdfSafe, textBlock } from './pdfutil.js';
 
 let root, getF, all = [], view = [], selected = new Set(), limit = 100, busy = false;
 let stretches = [], stretchMap = new Map();
@@ -20,21 +23,30 @@ export function initReport(el) {
       <label class="chk"><input type="checkbox" id="rp-all"><span>Select all <b id="rp-count">0</b> shown</span></label>
       <span class="spacer"></span>
       <span class="muted" id="rp-sel">0 selected</span>
-      <button class="btn" id="rp-csv">Export Excel (CSV)</button>
+      <button class="btn" id="rp-mat">Material summary</button>
+      <button class="btn" id="rp-xlsx">Excel (.xlsx)</button>
+      <button class="btn ghost" id="rp-csv" title="Plain CSV file">CSV</button>
       <button class="btn primary" id="rp-pdf" disabled>Download PDF</button>
     </div>
     <div id="rp-list" class="rp-list"><div class="empty">Loading…</div></div>
     <dialog id="rp-dlg" class="dlg"></dialog>`;
-  getF = wireFilterBar('rp', () => { limit = 100; render(); });
+  getF = wireFilterBar('rp', () => { limit = 100; render(); renderStretches(); });
   $('#rp-refresh').onclick = () => load(true);
   $('#rp-all').onchange = (e) => { view.forEach(s => (e.target.checked ? selected.add(s.id) : selected.delete(s.id))); render(); };
   $('#rp-pdf').onclick = () => makePDF(all.filter(s => selected.has(s.id)));
   $('#rp-csv').onclick = exportCSV;
+  $('#rp-xlsx').onclick = exportXLSX;
+  $('#rp-mat').onclick = openMaterialSummary;
   $('#rp-list').addEventListener('click', onListClick);
   $('#rp-st-list').addEventListener('click', async (e) => {
     const b = e.target.closest('[data-delst]'); if (!b) return;
     if (!confirm('Delete this survey stretch record? Surveys recorded in it are kept.')) return;
     try { await deleteStretch(b.dataset.delst); toast('Stretch deleted', 'ok'); } catch (err) { toast(err.message, 'err'); }
+  });
+  $('#rp-st-list').addEventListener('click', (e) => {
+    const pdf = e.target.closest('[data-stpdf]'), ed = e.target.closest('[data-edst]');
+    if (pdf) makeStretchPDFs(pdf.dataset.stpdf === '*' ? stretchView : stretches.filter(x => x.id === pdf.dataset.stpdf));
+    if (ed) editStretch(stretchMap.get(ed.dataset.edst), () => {});
   });
   $('#rp-list').addEventListener('change', (e) => {
     const cb = e.target.closest('input[data-sel]'); if (!cb) return;
@@ -65,21 +77,26 @@ async function load(fresh) {
 const pointText = (p) => (p ? `${p.location} (${fmtLatLng(p.gps)})` : 'Not yet ended');
 const mapLink = (g) => `<a href="https://www.google.com/maps?q=${g.lat},${g.lng}" target="_blank" rel="noopener">${fmtLatLng(g)}</a>`;
 
+let stretchView = [];
 function renderStretches() {
   const counts = {};
   all.forEach(s => { if (s.stretchId) counts[s.stretchId] = (counts[s.stretchId] || 0) + 1; });
-  const list = [...stretches].sort((a, b) => (b.seq || 0) - (a.seq || 0));
-  const open = list.filter(x => !x.end).length;
-  $('#rp-st-n').textContent = list.length ? `(${list.length}${open ? `, ${open} open` : ''})` : '(none yet)';
-  $('#rp-st-list').innerHTML = list.map(x => `
+  stretchView = filterStretches([...stretches].sort((a, b) => (b.seq || 0) - (a.seq || 0)), getF());
+  const open = stretchView.filter(x => !x.end).length;
+  $('#rp-st-n').textContent = stretches.length ? `(${stretchView.length}${open ? `, ${open} open` : ''})` : '(none yet)';
+  const adm = role() === 'admin';
+  $('#rp-st-list').innerHTML = (stretchView.length ? `<div class="st-top"><button class="btn small" data-stpdf="*">PDF of all ${stretchView.length} listed</button></div>` : '') + stretchView.map(x => {
+    const hrs = (Date.now() - new Date(x.start.at)) / 3600000, km = stretchKm(x);
+    return `
     <div class="st-item"><div class="st-main">
       <b>${esc(x.ref)}</b> <b class="lv lv${lineVoltageOf(x) === '33 kV' ? '33' : '11'}">${lineVoltageOf(x)}</b> ${esc(lineTitle(x))}
-      ${x.end ? '' : '<span class="pill mat">Open</span>'}<br>
-      <span class="muted">${esc(x.surveyor?.name)} · ${counts[x.id] || 0} survey${counts[x.id] === 1 ? '' : 's'} · ${fmtDateTime(x.start.at)}</span><br>
+      ${x.end ? '' : `<span class="pill mat">Open${hrs > 24 ? ' · ' + (hrs >= 48 ? Math.floor(hrs / 24) + ' days' : Math.round(hrs) + ' h') : ''}</span>`}<br>
+      <span class="muted">${esc(x.surveyor?.name)} · ${counts[x.id] || 0} survey${counts[x.id] === 1 ? '' : 's'} · ${fmtDateTime(x.start.at)}${km != null ? ` · ≈ ${km < 1 ? Math.round(km * 1000) + ' m' : km.toFixed(1) + ' km'}` : ''}</span><br>
       <b>Start:</b> ${esc(x.start.location)} · ${mapLink(x.start.gps)}<br>
       <b>End:</b> ${x.end ? `${esc(x.end.location)} · ${mapLink(x.end.gps)}` : '<span class="muted">not yet entered</span>'}
-    </div>${role() === 'admin' ? `<button class="btn small danger" data-delst="${x.id}">Delete</button>` : ''}</div>`).join('')
-    || '<div class="empty">No survey stretches yet.</div>';
+    </div><div class="st-actions"><button class="btn small" data-stpdf="${x.id}">PDF</button>
+      ${adm ? `<button class="btn small" data-edst="${x.id}">Edit</button><button class="btn small danger" data-delst="${x.id}">Delete</button>` : ''}</div></div>`; }).join('')
+    || '<div class="empty">No survey stretches match.</div>';
 }
 
 function render() {
@@ -91,7 +108,8 @@ function render() {
       <label class="rp-cb"><input type="checkbox" data-sel="${s.id}" ${selected.has(s.id) ? 'checked' : ''} aria-label="Select ${esc(s.ref)}"></label>
       <div class="rp-main" data-open="${s.id}">
         <div class="rp-top"><b>${esc(s.ref || s.id)}</b><span class="muted">${fmtDateTime(s.capturedAt || s.createdAt)}</span>
-          ${s.materialRequired ? '<span class="pill mat">Material</span>' : ''}</div>
+          ${s.materialRequired && !s.rectified ? '<span class="pill mat">Material</span>' : ''}
+          ${s.rectified ? '<span class="pill ok">Rectified</span>' : ''}</div>
         <div class="rp-sub"><b class="lv lv${lineVoltageOf(s) === '33 kV' ? '33' : '11'}">${lineVoltageOf(s)}</b> ${esc(linePath(s))}</div>
         <div class="rp-irr">${s.irregularities.map(i => `<span class="pill">${esc(irregularityName(i))}</span>`).join('')}</div>
         <div class="rp-loc muted">${esc(s.location)} — ${esc(s.landmark)}</div>
@@ -141,6 +159,7 @@ async function openDetail(s) {
         <dt>Stretch</dt><dd>${esc(x.ref)}</dd>
         <dt>Start point</dt><dd>${esc(x.start.location)} · ${mapLink(x.start.gps)}</dd>
         <dt>End point</dt><dd>${x.end ? `${esc(x.end.location)} · ${mapLink(x.end.gps)}` : 'Not yet ended'}</dd>`; })() : ''}
+        <dt>Status</dt><dd>${s.rectified ? `<b class="good">Rectified</b> on ${fmtDateTime(s.rectified.at)} by ${esc(s.rectified.by?.name)}` : '<b>Open</b>'}${s.editedAt ? ` <span class="muted">· corrected by admin ${fmtDate(s.editedAt)}</span>` : ''}</dd>
         <dt>Captured</dt><dd>${fmtDateTime(s.capturedAt)}</dd>
         <dt>Location</dt><dd>${esc(s.location)}</dd>
         <dt>Landmark</dt><dd>${esc(s.landmark)}</dd>
@@ -154,15 +173,25 @@ async function openDetail(s) {
       <div class="dlg-photos">${s.photos.map((p, i) => `<figure><div class="ph-load" data-key="${esc(p.key)}">Loading…</div><figcaption>#${i + 1} · ${fmtLatLng(p)} · ${fmtDateTime(p.takenAt)}</figcaption></figure>`).join('')}</div>
       <h3>Material required: ${s.materialRequired ? 'Yes' : 'No'}</h3>
       ${mats.length ? `<table class="tbl"><tbody>${mats.map(m => `<tr><td>${esc(m.item)}</td><td class="r num">${fmtNum(m.qty)} ${m.unit === 'm' ? 'm' : 'nos'}</td></tr>`).join('')}</tbody></table>` : ''}
+      ${s.rectified ? `<h3>Rectified</h3>${s.rectified.note ? `<p>${esc(s.rectified.note)}</p>` : ''}
+        <div class="dlg-photos">${(s.rectified.photos || []).map((p, i) => `<figure><div class="ph-load" data-key="${esc(p.key)}">Loading…</div><figcaption>After #${i + 1} · ${fmtDateTime(p.takenAt)}</figcaption></figure>`).join('')}</div>` : ''}
     </div>
     <div class="dlg-foot">
-      ${role() === 'admin' ? `<button class="btn danger" data-del>Delete</button>` : ''}
+      ${role() === 'admin' ? `<button class="btn danger" data-del>Delete</button><button class="btn" data-edit>Edit</button>${s.rectified ? '<button class="btn" data-reopen>Re-open</button>' : ''}` : ''}
       <span class="spacer"></span>
+      ${s.rectified ? '' : '<button class="btn" data-fix>Mark rectified</button>'}
       <button class="btn primary" data-pdf1>Download PDF</button>
     </div>`;
   dlg.showModal();
   dlg.querySelector('[data-close]').onclick = () => dlg.close();
   dlg.querySelector('[data-pdf1]').onclick = () => makePDF([s]);
+  const fix = dlg.querySelector('[data-fix]'); if (fix) fix.onclick = () => openRectify(s, dlg);
+  const edit = dlg.querySelector('[data-edit]'); if (edit) edit.onclick = () => editSurvey(s, () => dlg.close());
+  const reopen = dlg.querySelector('[data-reopen]');
+  if (reopen) reopen.onclick = async () => {
+    if (!confirm(`Re-open ${s.ref}? The "after" photographs of the rectification will be deleted.`)) return;
+    try { await unrectify(s.id); dlg.close(); toast('Survey re-opened', 'ok'); } catch (err) { toast(err.message, 'err'); }
+  };
   const del = dlg.querySelector('[data-del]');
   if (del) del.onclick = async () => {
     if (!confirm(`Delete survey ${s.ref} and its photographs permanently?`)) return;
@@ -177,26 +206,230 @@ async function openDetail(s) {
   }
 }
 
-/* ---------------- CSV ---------------- */
-function exportCSV() {
-  if (!view.length) { toast('Nothing to export', 'err'); return; }
-  const rows = view.filter(s => !selected.size || selected.has(s.id));
+/* ---------------- tables for CSV / Excel ---------------- */
+const pickRows = () => view.filter(s => !selected.size || selected.has(s.id));
+
+function surveyAOA(rows) {
   const head = ['Ref', 'Survey ID', 'Captured At', 'Submitted At', 'Line Type', 'Primary Substation', '33 kV Line', 'Section', 'Subdivision', 'Substation', 'Feeder', 'Irregularities',
-    'Location', 'Landmark', 'Remarks', 'Latitude', 'Longitude', 'GPS Accuracy (m)', 'Surveyor', 'Material Required',
+    'Location', 'Landmark', 'Remarks', 'Latitude', 'Longitude', 'GPS Accuracy (m)', 'Surveyor', 'Status', 'Rectified At', 'Rectified By', 'Rectification Note', 'Material Required',
     ...MATERIALS.map(m => `${m.item} (${m.unit === 'm' ? 'm' : 'Nos'})`), 'Photos', 'Google Maps',
     'Stretch Ref', 'Stretch Start Location', 'Stretch Start Lat', 'Stretch Start Lng', 'Stretch End Location', 'Stretch End Lat', 'Stretch End Lng'];
-  const lines = [head, ...rows.map(s => {
+  return [head, ...rows.map(s => {
     const q = Object.fromEntries((s.materials || []).map(m => [m.id, m.qty]));
+    const x = stretchMap.get(s.stretchId);
     return [s.ref, s.id, fmtDateTime(s.capturedAt), fmtDateTime(s.createdAt), lineVoltageOf(s), s.primarySubstation || '', s.line33 || '', s.section || '', s.subdivision, s.substation, s.feeder,
       s.irregularities.map(irregularityName).join('; '), s.location, s.landmark, s.remarks || '',
-      s.gps?.lat, s.gps?.lng, Math.round(s.gps?.acc || 0), s.surveyor?.name, s.materialRequired ? 'Yes' : 'No',
+      s.gps?.lat, s.gps?.lng, Math.round(s.gps?.acc || 0), s.surveyor?.name,
+      s.rectified ? 'Rectified' : 'Open', s.rectified ? fmtDateTime(s.rectified.at) : '', s.rectified?.by?.name || '', s.rectified?.note || '',
+      s.materialRequired ? 'Yes' : 'No',
       ...MATERIALS.map(m => q[m.id] || ''), s.photos.length, `https://www.google.com/maps?q=${s.gps?.lat},${s.gps?.lng}`,
-      ...(x => [x?.ref || '', x?.start.location || '', x?.start.gps.lat ?? '', x?.start.gps.lng ?? '',
-        x?.end?.location || '', x?.end?.gps.lat ?? '', x?.end?.gps.lng ?? ''])(stretchMap.get(s.stretchId))];
+      x?.ref || '', x?.start.location || '', x?.start.gps.lat ?? '', x?.start.gps.lng ?? '', x?.end?.location || '', x?.end?.gps.lat ?? '', x?.end?.gps.lng ?? ''];
   })];
-  const csv = lines.map(r => r.map(v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; }).join(',')).join('\r\n');
-  downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), `Line_Survey_${dayKey(new Date().toISOString())}_${rows.length}.csv`);
+}
+
+function stretchAOA(list) {
+  const counts = {};
+  all.forEach(s => { if (s.stretchId) counts[s.stretchId] = (counts[s.stretchId] || 0) + 1; });
+  const head = ['Ref', 'Line Type', 'Line / Feeder', 'Primary Substation', 'Section', 'Subdivision', 'Substation', 'Surveyor', 'Status', 'Surveys',
+    'Started At', 'Start Location', 'Start Lat', 'Start Lng', 'Ended At', 'End Location', 'End Lat', 'End Lng', 'Approx. Distance (km)'];
+  return [head, ...list.map(x => [x.ref, lineVoltageOf(x), lineTitle(x), x.primarySubstation || '', x.section || '', x.subdivision, x.substation, x.surveyor?.name, x.end ? 'Completed' : 'Open', counts[x.id] || 0,
+    fmtDateTime(x.start.at), x.start.location, x.start.gps.lat, x.start.gps.lng, x.end ? fmtDateTime(x.end.at) : '', x.end?.location || '', x.end?.gps.lat ?? '', x.end?.gps.lng ?? '',
+    stretchKm(x) == null ? '' : Math.round(stretchKm(x) * 100) / 100])];
+}
+
+function exportCSV() {
+  if (!view.length) { toast('Nothing to export', 'err'); return; }
+  const rows = pickRows();
+  const csv = surveyAOA(rows).map(r => r.map(v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; }).join(',')).join('\r\n');
+  downloadBlob(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }), `Line_Survey_${dayKey(new Date().toISOString())}_${rows.length}.csv`);
   toast(`Exported ${rows.length} survey${rows.length > 1 ? 's' : ''}${selected.size ? ' (selected)' : ''}`, 'ok');
+}
+
+/** The Excel library is large, so it is only fetched the first time someone exports. */
+let xlsxLoading = null;
+function ensureXLSX() {
+  if (window.XLSX) return Promise.resolve(true);
+  xlsxLoading ||= new Promise((res) => {
+    const el = document.createElement('script');
+    el.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    el.onload = () => res(!!window.XLSX);
+    el.onerror = () => { xlsxLoading = null; res(false); };
+    document.head.appendChild(el);
+  });
+  return xlsxLoading;
+}
+
+function sheetOf(aoa, widths) {
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = aoa[0].map((h, i) => ({ wch: widths?.[i] || Math.min(42, Math.max(10, String(h).length + 2, ...aoa.slice(1, 80).map(r => String(r[i] ?? '').length + 1))) }));
+  if (aoa.length > 1) ws['!autofilter'] = { ref: XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: aoa.length - 1, c: aoa[0].length - 1 } }) };
+  return ws;
+}
+
+/** Real .xlsx: Surveys, Stretches, Material summary (pending locations, by line) and Material total. */
+async function exportXLSX() {
+  if (!view.length) { toast('Nothing to export', 'err'); return; }
+  toast('Preparing Excel file…', 'info', 8000);
+  if (!(await ensureXLSX())) { toast('Could not load the Excel library (needs internet once). Saving CSV instead.', 'err', 6000); exportCSV(); return; }
+  const rows = pickRows();
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, sheetOf(surveyAOA(rows)), 'Surveys');
+  XLSX.utils.book_append_sheet(wb, sheetOf(stretchAOA(stretchView.length ? stretchView : stretches)), 'Stretches');
+  const sum = materialTables(rows.filter(s => !s.rectified), 'line');
+  XLSX.utils.book_append_sheet(wb, sheetOf(sum.matrix), 'Material by line');
+  XLSX.utils.book_append_sheet(wb, sheetOf(sum.total), 'Material total');
+  const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  downloadBlob(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), `Line_Survey_${dayKey(new Date().toISOString())}_${rows.length}.xlsx`);
+  toast(`Exported ${rows.length} survey${rows.length > 1 ? 's' : ''}${selected.size ? ' (selected)' : ''} to Excel. Material sheets count only locations not yet rectified.`, 'ok', 5000);
+}
+
+/* ---------------- material summary (procurement) ---------------- */
+const GROUPS = {
+  line: { label: 'Line / feeder', key: s => (lineVoltageOf(s) === '33 kV' ? `33 kV · ${s.line33}` : `11 kV · ${shortName(s.feeder)} feeder`) },
+  substation: { label: 'Substation', key: s => shortName(s.substation) },
+  subdivision: { label: 'Subdivision', key: s => s.subdivision },
+};
+
+/** Material needed per group; `rows` = surveys to count. Returns arrays for Excel plus the structure for the screen table. */
+function materialTables(rows, by) {
+  const needing = rows.filter(s => s.materialRequired && (s.materials || []).length);
+  const used = MATERIALS.filter(m => needing.some(s => s.materials.some(x => x.id === m.id)));
+  const groups = new Map();
+  for (const s of needing) {
+    const k = GROUPS[by].key(s);
+    const g = groups.get(k) || { n: 0, q: {} };
+    g.n++; (s.materials || []).forEach(m => (g.q[m.id] = (g.q[m.id] || 0) + m.qty));
+    groups.set(k, g);
+  }
+  const list = [...groups].sort((a, b) => a[0].localeCompare(b[0]));
+  const totals = Object.fromEntries(used.map(m => [m.id, list.reduce((n, [, g]) => n + (g.q[m.id] || 0), 0)]));
+  const locs = Object.fromEntries(used.map(m => [m.id, needing.filter(s => s.materials.some(x => x.id === m.id)).length]));
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const matrix = [[GROUPS[by].label, 'Locations needing material', ...used.map(m => `${m.item} (${m.unit === 'm' ? 'm' : 'Nos'})`)],
+    ...list.map(([k, g]) => [k, g.n, ...used.map(m => (g.q[m.id] ? r2(g.q[m.id]) : ''))]),
+    ['TOTAL', needing.length, ...used.map(m => r2(totals[m.id]))]];
+  const total = [['Item', 'Unit', 'Total quantity', 'Locations'], ...used.map(m => [m.item, m.unit === 'm' ? 'm' : 'Nos', r2(totals[m.id]), locs[m.id]])];
+  return { list, used, totals, needing, matrix, total };
+}
+
+function openMaterialSummary() {
+  const dlg = $('#rp-dlg');
+  let by = 'line', openOnly = true;
+  const draw = () => {
+    const base = pickRows();
+    const rows = openOnly ? base.filter(s => !s.rectified) : base;
+    const T = materialTables(rows, by);
+    dlg.innerHTML = `
+      <div class="dlg-head"><h2>Material summary</h2><button class="btn small ghost" data-close aria-label="Close">✕</button></div>
+      <div class="dlg-body">
+        <div class="ms-ctl">
+          <label class="fld sm">Group by<select id="ms-by">${Object.entries(GROUPS).map(([k, g]) => `<option value="${k}" ${k === by ? 'selected' : ''}>${esc(g.label)}</option>`).join('')}</select></label>
+          <label class="chk"><input type="checkbox" id="ms-open" ${openOnly ? 'checked' : ''}><span>Only locations not yet rectified</span></label>
+        </div>
+        <p class="hint">Based on ${rows.length} survey${rows.length === 1 ? '' : 's'} ${selected.size ? '(the rows you selected)' : '(current Report filters)'}; ${T.needing.length} need material.</p>
+        ${T.needing.length ? `
+        <h3>Total to procure</h3>
+        <table class="tbl"><thead><tr><th>Item</th><th class="r">Quantity</th><th class="r">Locations</th></tr></thead><tbody>
+          ${T.total.slice(1).map(r => `<tr><td>${esc(r[0])}</td><td class="r num">${fmtNum(r[2])} ${r[1]}</td><td class="r num">${r[3]}</td></tr>`).join('')}</tbody></table>
+        <h3>By ${esc(GROUPS[by].label.toLowerCase())}</h3>
+        <div class="tbl-wrap"><table class="tbl ms-tbl"><thead><tr><th>${esc(GROUPS[by].label)}</th><th class="r">Loc.</th>${T.used.map(m => `<th class="r">${esc(m.item)}<br><small>${m.unit === 'm' ? 'm' : 'Nos'}</small></th>`).join('')}</tr></thead>
+        <tbody>${T.list.map(([k, g]) => `<tr><td>${esc(k)}</td><td class="r num">${g.n}</td>${T.used.map(m => `<td class="r num">${g.q[m.id] ? fmtNum(g.q[m.id]) : ''}</td>`).join('')}</tr>`).join('')}
+        <tr class="grp"><td>Total</td><td class="r num">${T.needing.length}</td>${T.used.map(m => `<td class="r num">${fmtNum(T.totals[m.id])}</td>`).join('')}</tr></tbody></table></div>`
+        : '<div class="empty">No material is required for these surveys.</div>'}
+      </div>
+      <div class="dlg-foot"><span class="spacer"></span>
+        <button class="btn primary" id="ms-xlsx" ${T.needing.length ? '' : 'disabled'}>Download Excel</button></div>`;
+    dlg.querySelector('[data-close]').onclick = () => dlg.close();
+    $('#ms-by', dlg).onchange = (e) => { by = e.target.value; draw(); };
+    $('#ms-open', dlg).onchange = (e) => { openOnly = e.target.checked; draw(); };
+    $('#ms-xlsx', dlg).onclick = async () => {
+      if (!(await ensureXLSX())) { toast('Could not load the Excel library (needs internet once)', 'err', 5000); return; }
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, sheetOf(T.matrix), `By ${GROUPS[by].label.split(' ')[0]}`.slice(0, 31));
+      XLSX.utils.book_append_sheet(wb, sheetOf(T.total), 'Total');
+      downloadBlob(new Blob([XLSX.write(wb, { bookType: 'xlsx', type: 'array' })], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }),
+        `Material_Summary_${by}_${dayKey(new Date().toISOString())}.xlsx`);
+    };
+  };
+  draw();
+  dlg.showModal();
+}
+
+/* ---------------- rectification: "fixed on site" ---------------- */
+function openRectify(s, parentDlg) {
+  let d = $('#fx-dlg');
+  if (!d) { d = document.createElement('dialog'); d.id = 'fx-dlg'; d.className = 'dlg'; document.body.appendChild(d); }
+  const photos = [];   // { blob, url, meta }
+  d.innerHTML = `
+    <form method="dialog" id="fx-form">
+      <div class="dlg-head"><h2>Mark ${esc(s.ref)} as rectified</h2><button type="button" class="btn small ghost" data-close aria-label="Close">✕</button></div>
+      <div class="dlg-body">
+        <p class="hint">${esc(linePath(s))}<br>${esc(s.location)} · ${esc(s.landmark)}</p>
+        <p class="hint">Take 1 to 3 photographs of the completed work (GPS and time are stamped on them).</p>
+        <div class="photo-grid" id="fx-grid"></div>
+        <input type="file" id="fx-cam" accept="image/*" capture="environment" hidden>
+        <label class="fld">Note <span class="opt">(optional)</span><textarea id="fx-note" rows="2" maxlength="500" placeholder="e.g. Pole replaced, 2 pin insulators changed"></textarea></label>
+        <div id="fx-err" class="errors" hidden></div>
+      </div>
+      <div class="dlg-foot"><span class="spacer"></span><button type="button" class="btn" data-close>Cancel</button><button type="submit" class="btn primary" id="fx-save" disabled>Save</button></div>
+    </form>`;
+  const grid = $('#fx-grid', d), cam = $('#fx-cam', d), save = $('#fx-save', d);
+  const paint = () => {
+    grid.innerHTML = photos.map((p, i) => `<figure class="ph"><img src="${p.url}" alt="After photo ${i + 1}"><figcaption>#${i + 1}${p.meta.acc != null ? ` · ±${Math.round(p.meta.acc)} m` : ''}</figcaption>
+      <button type="button" class="ph-rm" data-rm="${i}" aria-label="Remove photo ${i + 1}">×</button></figure>`).join('') +
+      (photos.length < 3 ? `<button type="button" class="ph add" id="fx-add"><span>${photos.length ? 'Take another' : 'Take photo'}</span></button>` : '');
+    save.disabled = !photos.length;
+  };
+  paint();
+  grid.addEventListener('click', (e) => {
+    const rm = e.target.closest('[data-rm]');
+    if (rm) { URL.revokeObjectURL(photos[+rm.dataset.rm].url); photos.splice(+rm.dataset.rm, 1); paint(); }
+    else if (e.target.closest('#fx-add')) cam.click();
+  });
+  const getPos = () => new Promise(res => (navigator.geolocation
+    ? navigator.geolocation.getCurrentPosition(p => res({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy }), () => res(null), { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 })
+    : res(null)));
+  cam.onchange = async () => {
+    const f = cam.files[0]; cam.value = ''; if (!f || photos.length >= 3) return;
+    const add = $('#fx-add', d); if (add) { add.disabled = true; add.firstElementChild.textContent = 'Getting GPS…'; }
+    const pos = await getPos(), now = new Date();
+    const lines = [`RECTIFIED | ${s.ref} | ${lineTitle(s)}`,
+      pos ? `Lat ${pos.lat.toFixed(6)}  Lng ${pos.lng.toFixed(6)}  ±${Math.round(pos.acc)} m` : 'GPS not available',
+      `${fmtDateTime(now.toISOString())}  |  ${getSettings().name || ''}`];
+    try {
+      const { blob } = await stampPhoto(f, lines);
+      photos.push({ blob, url: URL.createObjectURL(blob), meta: { lat: pos?.lat ?? null, lng: pos?.lng ?? null, acc: pos?.acc ?? null, takenAt: now.toISOString() } });
+    } catch (err) { toast(err.message, 'err'); }
+    paint();
+  };
+  $$('[data-close]', d).forEach(b => (b.onclick = () => { photos.forEach(p => URL.revokeObjectURL(p.url)); d.close(); }));
+  $('#fx-form', d).onsubmit = async (e) => {
+    e.preventDefault();
+    const name = (getSettings().name || '').trim();
+    if (!name) { const er = $('#fx-err', d); er.hidden = false; er.textContent = 'Enter your name in Settings first.'; return; }
+    save.disabled = true;
+    try {
+      await queueRectify(s.id, { note: $('#fx-note', d).value.trim(), by: { name }, at: new Date().toISOString(), photos: photos.map(p => p.meta) }, photos.map(p => p.blob));
+      toast(navigator.onLine ? 'Saved. Uploading…' : 'Saved offline. Will upload when online', 'ok');
+      photos.forEach(p => URL.revokeObjectURL(p.url));
+      d.close(); if (parentDlg) parentDlg.close();
+    } catch (err) { const er = $('#fx-err', d); er.hidden = false; er.textContent = err.message; save.disabled = false; }
+  };
+  d.showModal();
+}
+
+/* ---------------- stretch PDF ---------------- */
+function makeStretchPDFs(list) {
+  if (!list.length) return;
+  if (!window.jspdf) { toast('PDF library not loaded. Connect to the internet once and reload', 'err', 6000); return; }
+  try {
+    const doc = buildStretchPDF(list, all);
+    const name = list.length === 1
+      ? `${list[0].ref}_${lineTitle(list[0]).replace(/[^A-Za-z0-9]+/g, '_')}.pdf`
+      : `Stretch_Report_${list.length}_stretches_${dayKey(new Date().toISOString())}.pdf`;
+    downloadBlob(doc.output('blob'), name);
+    toast('PDF downloaded', 'ok');
+  } catch (err) { console.error(err); toast('PDF failed: ' + err.message, 'err', 6000); }
 }
 
 /* ---------------- PDF ---------------- */
@@ -231,7 +464,6 @@ async function makePDF(surveys) {
   }
 }
 
-const NAVY = [18, 53, 91], AMBER = [242, 169, 0], INK = [20, 27, 38], GREY = [96, 106, 120], LINE = [212, 218, 226], TINT = [244, 246, 249];
 
 async function drawPage(doc, s, pageNo, pageCount) {
   const W = 210, H = 297, M = 12, CW = W - 2 * M;
@@ -287,6 +519,8 @@ async function drawPage(doc, s, pageNo, pageCount) {
     doc.link(M, startY, half, y - startY, { url: `https://www.google.com/maps?q=${sx.start.gps.lat},${sx.start.gps.lng}` });
     if (sx.end) doc.link(M + half, startY, half, y - startY, { url: `https://www.google.com/maps?q=${sx.end.gps.lat},${sx.end.gps.lng}` });
   }
+
+  if (s.rectified) row1('Rectified', `${fmtDateTime(s.rectified.at)} by ${s.rectified.by?.name || '-'}${s.rectified.note ? ' - ' + s.rectified.note : ''}`);
 
   // Irregularities
   y += 5;
@@ -387,49 +621,4 @@ async function drawPage(doc, s, pageNo, pageCount) {
   doc.setFontSize(7.5); doc.setTextColor(...GREY); doc.setFont('helvetica', 'normal');
   doc.text(`Survey ID ${s.id}  |  Submitted ${fmtDateTime(s.createdAt)}  |  Generated ${fmtDateTime(new Date().toISOString())}`, M, footerY);
   doc.text(`Page ${pageNo} of ${pageCount}`, W - M, footerY, { align: 'right' });
-}
-
-function sectionTitle(doc, x, y, text) {
-  doc.setFont('helvetica', 'bold'); doc.setFontSize(8.5); doc.setTextColor(...NAVY);
-  doc.text(text, x, y);
-}
-
-/* ---- text helpers: jsPDF core fonts only cover Latin-1, so Hindi/other scripts are rasterised ---- */
-const pdfSafe = (t) => String(t ?? '').replace(/[\u2013\u2014]/g, '-').replace(/[\u2018\u2019]/g, "'")
-  .replace(/[\u201C\u201D]/g, '"').replace(/\u2026/g, '...').replace(/\u00A0/g, ' ');
-const PX_PER_MM = 9;
-
-/** Returns { n: lineCount, draw(x, baselineY) } using vector text when possible, otherwise a crisp bitmap. */
-function textBlock(doc, text, widthMm, pt, lineH, bold = false) {
-  const t = pdfSafe(text);
-  if (!/[^\x00-\xFF]/.test(t)) {
-    doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(pt);
-    const lines = doc.splitTextToSize(t, widthMm);
-    return { n: lines.length, draw: (x, y) => {
-      doc.setFont('helvetica', bold ? 'bold' : 'normal'); doc.setFontSize(pt); doc.setTextColor(...INK);
-      doc.text(lines, x, y, { lineHeightFactor: lineH / (pt * 0.3528) });
-    } };
-  }
-  const fontPx = pt * 0.3528 * PX_PER_MM;
-  const c = document.createElement('canvas');
-  const ctx = c.getContext('2d');
-  const font = `${bold ? 700 : 400} ${fontPx}px "Noto Sans Devanagari", "Nirmala UI", Mangal, system-ui, sans-serif`;
-  ctx.font = font;
-  const maxPx = widthMm * PX_PER_MM, lines = [];
-  for (const para of t.split(/\n/)) {
-    let cur = '';
-    for (const w of para.split(/\s+/)) {
-      const tryL = cur ? cur + ' ' + w : w;
-      if (ctx.measureText(tryL).width > maxPx && cur) { lines.push(cur); cur = w; } else cur = tryL;
-    }
-    lines.push(cur);
-  }
-  const lhPx = lineH * PX_PER_MM;
-  c.width = Math.ceil(maxPx); c.height = Math.ceil(lines.length * lhPx + fontPx * 0.4);
-  ctx.font = font; ctx.fillStyle = `rgb(${INK.join(',')})`; ctx.textBaseline = 'alphabetic';
-  lines.forEach((l, i) => ctx.fillText(l, 0, fontPx * 0.95 + i * lhPx));
-  const url = c.toDataURL('image/png');
-  return { n: lines.length, draw: (x, y) => {
-    doc.addImage(url, 'PNG', x, y - pt * 0.3528 * 0.95, c.width / PX_PER_MM, c.height / PX_PER_MM, undefined, 'FAST');
-  } };
 }

@@ -22,6 +22,15 @@ export const IRREGULARITIES = [
   { code: 'OTHER',             label: 'Other',                            needsText: true },
 ];
 
+/**
+ * Which irregularities make sense on which kind of line.
+ *   33 kV survey: only 33 kV variants; no LT-only items (GI Wire Line, Damage AB Cable).
+ *   11 kV survey: 11 kV and LT variants (LT lines share the poles); never 33 kV variants.
+ */
+export const allowedVariants = (def, lv) => (def.variants ? def.variants.filter(v => (lv === V33 ? v === V33 : v !== V33)) : null);
+export const appliesTo = (def, lv) => !(lv === V33 && def.code === 'DAMAGE_AB_CABLE') && (!def.variants || allowedVariants(def, lv).length > 0);
+export const irregularitiesFor = (lv) => IRREGULARITIES.filter(d => appliesTo(d, lv)).map(d => (d.variants ? { ...d, variants: allowedVariants(d, lv) } : d));
+
 export const irregularityName = (it) =>
   it.code === 'OTHER' ? `Other: ${it.text || ''}`.trim()
   : it.voltage ? `${labelOf(it.code)} (${it.voltage})` : labelOf(it.code);
@@ -104,7 +113,9 @@ export function validateSurvey(s, HIERARCHY, LINES = LINES33) {
   else for (const it of s.irregularities) {
     const def = IRREGULARITIES.find(d => d.code === it.code);
     if (!def) { e.push(`Unknown irregularity ${it.code}`); continue; }
-    if (def.variants && !def.variants.includes(it.voltage)) e.push(`Choose voltage for ${def.label}`);
+    const lv = lineVoltageOf(s);
+    if (!appliesTo(def, lv)) { e.push(`${def.label} does not apply to a ${lv} line`); continue; }
+    if (def.variants && !allowedVariants(def, lv).includes(it.voltage)) e.push(`Choose voltage for ${def.label}`);
     if (def.needsText && !str(it.text, 300)) e.push('Describe the "Other" irregularity');
   }
   if (!str(s.location)) e.push('Location is required');
@@ -143,4 +154,31 @@ export function validateStretch(s, HIERARCHY, LINES = LINES33) {
   if (s.end !== undefined && s.end !== null) e.push(...pointErrors(s.end, 'End'));
   if (!s.surveyor || typeof s.surveyor.name !== 'string' || !s.surveyor.name.trim()) e.push('Surveyor name missing (open Settings)');
   return e;
+}
+
+/* ---------------- admin corrections ---------------- */
+const LINE_KEYS = ['lineVoltage', 'primarySubstation', 'line33', 'section', 'substation', 'subdivision', 'feeder'];
+
+/** Survey after an admin correction (before validation). Photos, GPS, surveyor, stretch and rectification are never touched. */
+export function mergeSurveyEdit(old, body) {
+  const next = { ...old };
+  if (LINE_KEYS.some(k => k in body)) {
+    for (const k of LINE_KEYS) delete next[k];
+    for (const k of LINE_KEYS) if (k in body) next[k] = body[k];
+  }
+  for (const k of ['irregularities', 'location', 'landmark', 'remarks', 'materialRequired', 'materials']) if (k in body) next[k] = body[k];
+  if (next.materialRequired === false) next.materials = [];
+  return next;
+}
+
+/** Stretch after an admin correction: line fields and the typed start / end location (GPS and times stay). */
+export function mergeStretchEdit(old, body) {
+  const next = { ...old, start: { ...old.start }, end: old.end ? { ...old.end } : null };
+  if (LINE_KEYS.some(k => k in body)) {
+    for (const k of LINE_KEYS) delete next[k];
+    for (const k of LINE_KEYS) if (k in body) next[k] = body[k];
+  }
+  if (typeof body.startLocation === 'string') next.start.location = body.startLocation;
+  if (typeof body.endLocation === 'string' && next.end) next.end.location = body.endLocation;
+  return next;
 }

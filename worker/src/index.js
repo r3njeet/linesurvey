@@ -18,7 +18,9 @@
  *   ALLOWED_ORIGINS  comma separated origins allowed by CORS, or "*"
  */
 import { HIERARCHY } from '../../web/js/masters.js';
-import { validateSurvey, validateStretch, MIN_PHOTOS, MAX_PHOTOS } from '../../web/js/catalog.js';
+import { validateSurvey, validateStretch, mergeSurveyEdit, mergeStretchEdit, MIN_PHOTOS, MAX_PHOTOS } from '../../web/js/catalog.js';
+
+const MAX_FIX_PHOTOS = 3;
 
 const INDEX_KEY = 'index/surveys.json';
 // Two kinds of records share the same storage pattern: one JSON file per record + one combined index.
@@ -76,10 +78,14 @@ async function route(request, env) {
     if (role !== 'admin') throw httpError(403, 'Only admin can do this');
     return deleteStretch(delSt[1], env);
   }
+  if (delSt && m === 'PATCH') {
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
+    return patchStretch(delSt[1], request, env);
+  }
 
   if (p === '/api/photo' && m === 'GET') {
     const key = url.searchParams.get('key') || '';
-    if (!/^photos\/[0-9]{4}-[0-9]{2}\/[A-Za-z0-9-]+\/[0-9]+\.jpg$/.test(key)) throw httpError(400, 'Bad photo key');
+    if (!/^photos\/[0-9]{4}-[0-9]{2}\/[A-Za-z0-9-]+\/(fix-)?[0-9]+\.jpg$/.test(key)) throw httpError(400, 'Bad photo key');
     const obj = await env.BUCKET.get(key);
     if (!obj) throw httpError(404, 'Photo not found');
     return new Response(obj.body, {
@@ -91,6 +97,16 @@ async function route(request, env) {
   if (del && m === 'DELETE') {
     if (role !== 'admin') throw httpError(403, 'Only admin can do this');
     return deleteSurvey(del[1], env);
+  }
+  if (del && m === 'PATCH') {                                   // admin corrects an entry
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
+    return patchSurvey(del[1], request, env);
+  }
+  const rect = p.match(/^\/api\/surveys\/([A-Za-z0-9-]{8,64})\/rectify$/);
+  if (rect && m === 'POST') return rectifySurvey(rect[1], request, env);   // anyone can report a fix
+  if (rect && m === 'DELETE') {                                            // admin re-opens it
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
+    return unrectifySurvey(rect[1], env);
   }
 
   if (p === '/api/admin/rebuild-index' && m === 'POST') {
@@ -238,6 +254,107 @@ async function deleteStretch(id, env) {
   return json({ ok: true, deleted: id });
 }
 
+/* ---------------- admin corrections ---------------- */
+/** Replace one record in both its own file and the combined index. */
+async function replaceRecord(env, kind, rec) {
+  await updateIndex(env, (list) => list.map(r => (r.id === rec.id ? rec : r)), kind);
+  await env.BUCKET.put(`${KINDS[kind].prefix}${rec.id}.json`, JSON.stringify(rec), { httpMetadata: { contentType: 'application/json' } });
+}
+async function readRecord(env, kind, id) {
+  const obj = await env.BUCKET.get(`${KINDS[kind].prefix}${id}.json`);
+  if (!obj) throw httpError(404, kind === 'surveys' ? 'Survey not found' : 'Stretch not found');
+  return obj.json();
+}
+async function bodyJson(request) { try { return await request.json(); } catch { throw httpError(400, 'Invalid JSON'); } }
+
+/** Admin: fix the line, irregularities, location / landmark / remarks or materials of a survey. Photos, GPS and surveyor stay. */
+async function patchSurvey(id, request, env) {
+  const body = await bodyJson(request);
+  const old = await readRecord(env, 'surveys', id);
+  const next = mergeSurveyEdit(old, body);
+  const errors = validateSurvey(next, HIERARCHY);
+  if (errors.length) return json({ ok: false, error: errors.join('; '), errors }, 422);
+  const rec = {
+    ...sanitize(next, old.photos, new Date(old.createdAt)),
+    seq: old.seq, ref: old.ref,
+    ...(old.rectified ? { rectified: old.rectified } : {}),
+    editedAt: new Date().toISOString(),
+  };
+  await replaceRecord(env, 'surveys', rec);
+  return json({ ok: true, survey: rec });
+}
+
+/** Admin: fix the line and the typed start / end location of a stretch (GPS and times stay). */
+async function patchStretch(id, request, env) {
+  const body = await bodyJson(request);
+  const old = await readRecord(env, 'stretches', id);
+  const next = mergeStretchEdit(old, body);
+  const errors = validateStretch(next, HIERARCHY);
+  if (errors.length) return json({ ok: false, error: errors.join('; '), errors }, 422);
+  const lv33 = next.lineVoltage === '33 kV';
+  const rec = {
+    id: old.id, seq: old.seq, ref: old.ref, createdAt: old.createdAt, surveyor: old.surveyor,
+    lineVoltage: lv33 ? '33 kV' : '11 kV',
+    subdivision: next.subdivision, substation: next.substation, feeder: lv33 ? '' : next.feeder,
+    ...(lv33 ? { primarySubstation: next.primarySubstation, line33: next.line33, section: next.section } : {}),
+    start: cleanPoint(next.start, new Date(old.createdAt)),
+    end: next.end ? cleanPoint(next.end, new Date(old.createdAt)) : null,
+    editedAt: new Date().toISOString(),
+  };
+  await replaceRecord(env, 'stretches', rec);
+  return json({ ok: true, stretch: rec });
+}
+
+/* ---------------- rectification ("fixed on site") ---------------- */
+async function rectifySurvey(id, request, env) {
+  const ct = request.headers.get('Content-Type') || '';
+  if (!ct.includes('multipart/form-data')) throw httpError(415, 'Expected multipart/form-data');
+  const form = await request.formData();
+  let d;
+  try { d = JSON.parse(form.get('data')); } catch { throw httpError(400, 'Invalid JSON in "data"'); }
+  const photos = [];
+  for (let i = 0; i < MAX_FIX_PHOTOS; i++) { const f = form.get(`photo_${i}`); if (f && typeof f === 'object') photos.push(f); }
+  const errors = [];
+  if (!str(d.by?.name, 100)) errors.push('Name missing (open Settings)');
+  if (!photos.length) errors.push('Add at least one photograph of the completed work');
+  if (d.note != null && typeof d.note !== 'string') errors.push('Invalid note');
+  for (const f of photos) {
+    if (f.size > MAX_PHOTO_BYTES) errors.push('A photo is larger than 6 MB');
+    if (f.type && !/^image\/jpe?g$/.test(f.type)) errors.push('Photos must be JPEG');
+  }
+  if (errors.length) return json({ ok: false, error: errors.join('; '), errors }, 422);
+
+  const old = await readRecord(env, 'surveys', id);
+  if (old.rectified) return json({ ok: true, duplicate: true, survey: old });   // retry of an upload that already worked
+  const month = String(old.createdAt).slice(0, 7);
+  const meta = [];
+  for (let i = 0; i < photos.length; i++) {
+    const key = `photos/${month}/${id}/fix-${i + 1}.jpg`;
+    await env.BUCKET.put(key, photos[i].stream(), { httpMetadata: { contentType: 'image/jpeg' }, customMetadata: { survey: id, kind: 'rectification' } });
+    const pm = d.photos?.[i] || {};
+    meta.push({ key, lat: num(pm.lat), lng: num(pm.lng), acc: num(pm.acc), takenAt: str(pm.takenAt, 40) });
+  }
+  const rec = { ...old, rectified: {
+    at: str(d.at, 40) || new Date().toISOString(),
+    by: { name: str(d.by.name, 100) },
+    note: str(d.note, 500),
+    photos: meta,
+  } };
+  await replaceRecord(env, 'surveys', rec);
+  return json({ ok: true, survey: rec }, 201);
+}
+
+/** Admin: the work was not really done: re-open the survey and remove the "after" photos. */
+async function unrectifySurvey(id, env) {
+  const old = await readRecord(env, 'surveys', id);
+  if (!old.rectified) return json({ ok: true, survey: old });
+  const keys = (old.rectified.photos || []).map(p => p.key);
+  const rec = { ...old }; delete rec.rectified;
+  await replaceRecord(env, 'surveys', rec);
+  if (keys.length) await env.BUCKET.delete(keys);
+  return json({ ok: true, survey: rec });
+}
+
 /* ---------------- delete ---------------- */
 async function deleteSurvey(id, env) {
   const obj = await env.BUCKET.get(`surveys/${id}.json`);
@@ -247,7 +364,7 @@ async function deleteSurvey(id, env) {
     return list.filter(r => r.id !== id);
   });
   if (!rec) throw httpError(404, 'Survey not found');
-  const keys = [`surveys/${id}.json`, ...(rec.photos || []).map(p => p.key)];
+  const keys = [`surveys/${id}.json`, ...(rec.photos || []).map(p => p.key), ...(rec.rectified?.photos || []).map(p => p.key)];
   await env.BUCKET.delete(keys);
   return json({ ok: true, deleted: id });
 }
@@ -301,7 +418,7 @@ function corsHeaders(request, env) {
   const allow = allowed.includes('*') ? '*' : (allowed.includes(origin) ? origin : allowed[0]);
   return {
     'Access-Control-Allow-Origin': allow,
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PATCH,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type,X-Access-Key',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',

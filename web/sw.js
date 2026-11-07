@@ -5,7 +5,7 @@ const CACHE = 'line-survey-' + VERSION;
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'css/app.css',
   'js/app.js', 'js/api.js', 'js/catalog.js', 'js/config.js', 'js/dashboard.js', 'js/db.js',
-  'js/filters.js', 'js/masters.js', 'js/report.js', 'js/survey.js', 'js/util.js',
+  'js/editor.js', 'js/filters.js', 'js/i18n.js', 'js/masters.js', 'js/pdf-stretch.js', 'js/pdfutil.js', 'js/report.js', 'js/survey.js', 'js/util.js',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png',
   'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css',
   'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js',

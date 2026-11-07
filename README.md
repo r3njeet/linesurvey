@@ -37,7 +37,9 @@ geotagged photographs, material requirements, a progress dashboard, and one-page
    Line details are then locked and photos unlock. Record as many irregularities as you find along the stretch. When you reach the end, enter the **end point** and tap *End survey here*
    (GPS captured automatically). The end point can be entered after the survey, even after closing the app or being offline: the open stretch is kept on the phone.
    Every survey records which stretch it belongs to.
-3. Tick the irregularities. Items that depend on line voltage ask for 33 kV / 11 kV / LT:
+   * **End a stretch from any phone:** *Open stretches* lists every stretch that has no end point yet (from any phone). Tap **Continue** to carry on with it or to finish it. If someone else ends it first, the other phone drops it automatically.
+   * **Warnings** (you can still go ahead): another open stretch on the same line; a stretch left open more than 24 hours; an end point more than 15 km from the start point.
+3. Tick the irregularities. **Only the items that make sense for the chosen line are shown:** a 33 kV line has no LT items (GI Wire Line, Damage AB Cable) and only the 33 kV variants; an 11 kV line offers 11 kV and LT variants but never 33 kV. When only one voltage is possible it is filled in automatically (the server checks this too). Items that depend on line voltage ask for 33 kV / 11 kV / LT:
    Tilted, Dilapidated, Rusted, Broken Pole · Sagged Line {33/11/LT} · House/Construction Under Line {33/11/LT} · Long Span Line ·
    Low Ground Clearance {33/11/LT} · Road/Canal/River Crossing · GI Wire Line {11/LT} · Too Many Joints In Span {33/11/LT} ·
    Damage AB Cable · Damage Pin Insulator {33/11} · Damage Disc {33/11} · Other (free text).
@@ -47,19 +49,26 @@ geotagged photographs, material requirements, a progress dashboard, and one-page
 6. **Material required?** Yes/No. If Yes, enter quantities:
    Pole (PCC 8.5/9/11 m, STP 9/11/13 m from the `POLE` sheet) in Nos, Conductor ACSR Weasel/Rabbit/Dog in metres,
    Pin Insulator 33/11 kV in Nos, Disc Insulator 33/11 kV in Nos, V Cross Arm 33/11 kV in Nos, LT AB Cable 1X16 / 3X50 / 3X95 / 3X120 sqmm in metres.
-7. **Submit.** Each survey gets a running number (`LS-00001`, …). **No network? No problem.** The survey is saved on the phone
+7. **Submit.** If a survey with the same irregularity already exists within 25 m on the same line, the app asks you to confirm before saving a duplicate. Each survey gets a running number (`LS-00001`, …). **No network? No problem.** The survey is saved on the phone
    and uploads automatically when the connection returns (the header shows "Offline · n pending").
+
+**Language:** the **EN / हि** button in the header switches the survey form, tabs and settings between English and Hindi. Nothing typed is lost when you switch. Dashboard and Report stay in English.
 
 **Dashboard tab:** survey count, irregularities found, locations needing material, feeder coverage (x/75);
 findings by irregularity (with voltage split); total material required; daily progress; progress by substation;
-map of survey points; surveyor-wise count. Everything can be filtered by subdivision, substation, feeder and date.
+map of survey points (rectified ones in green); surveyor-wise count. Also shows **Rectified** (done / still open), **Survey stretches** (done, open, total km start to end) and a stretch table. Material totals count only locations that are **not yet rectified**. Everything can be filtered by subdivision, substation, feeder and date.
 
 **Report tab:** filter by hierarchy, date, irregularity, material yes/no or free-text search. Then:
 * A **Survey stretches** list at the top shows every stretch with its start and end point (typed location + GPS map link), status (open / completed) and number of surveys. Admins can delete a stretch record.
-* **PDF** on any row gives a single-survey, single-page PDF. It includes the stretch start and end points.
+* Each stretch has a **one-page PDF** (details, plan of surveyed points with start S / numbered findings / end E, findings table, material still required) and a **PDF of all listed** stretches.
+* **PDF** on any row gives a single-survey, single-page PDF. It includes the stretch start and end points and the rectification status.
 * **Select several (or Select all)** and click **Download PDF** to get one PDF with one page per survey.
   Each page has the details, irregularities, all photographs with GPS captions, the material table and a clickable Google Maps link.
-* **Export Excel (CSV)** gives one row per survey with one column per material item (selected rows only, or all rows if none are selected).
+* **Excel (.xlsx)** downloads a real workbook with sheets *Surveys*, *Stretches*, *Material by line* and *Material total* (selected rows only, or all rows if none are selected). The Excel library is loaded on first use, so the first export needs internet; if it cannot load, a CSV is saved instead. **CSV** is still available.
+* **Material summary** shows total material grouped by **line / feeder, substation or subdivision** for procurement, with an option to count only locations not yet rectified, and downloads as Excel.
+* **Status filter** (All / Open / Rectified).
+* **Rectification tracking:** open a survey and tap **Mark rectified**. Add 1 to 3 "after" photos (stamped with GPS) and a note. Anyone can do this, and it also works offline. Rectified surveys show a green badge. An admin can **Re-open** a survey (its after-photos are removed).
+* **Admins can correct entries** with **Edit** on a survey or a stretch: line (feeder etc.), location, landmark, remarks, irregularities, material quantities, stretch start / end text. Photos and the reference number stay. The same rules as for new surveys are checked.
 * Tap a survey to see its details and photos. Admins can **delete** a survey (its photos are removed from R2 as well).
 
 ---
@@ -131,11 +140,15 @@ Everything is open to anyone with the link except deleting. `DELETE /api/surveys
 | GET | `/api/surveys` | all survey records (JSON) |
 | POST | `/api/stretches` | JSON stretch record (line + start point, end point once finished). Create-or-update, idempotent on stretch `id` |
 | GET | `/api/stretches` | all stretch records |
+| PATCH | `/api/stretches/:id` | admin: correct line / start or end location text |
 | DELETE | `/api/stretches/:id` | admin: delete a stretch record (surveys are kept) |
 | POST | `/api/surveys` | multipart: `data` (JSON) + `photo_0…photo_5` (JPEG). Idempotent on survey `id` |
 | GET | `/api/photo?key=photos/...jpg` | photo bytes |
-| DELETE | `/api/surveys/:id` | admin: delete a survey and its photos |
-| POST | `/api/admin/rebuild-index` | admin: rebuild `index/surveys.json` from `surveys/*.json` |
+| PATCH | `/api/surveys/:id` | admin: correct line, location, landmark, remarks, irregularities, materials (422 with errors if invalid) |
+| POST | `/api/surveys/:id/rectify` | multipart: `data` (JSON: `by.name`, `note`, `photos[]`) + `photo_0…photo_2` (1 to 3 JPEG). Public, idempotent (first rectification wins) |
+| DELETE | `/api/surveys/:id/rectify` | admin: re-open a rectified survey, deleting its after-photos |
+| DELETE | `/api/surveys/:id` | admin: delete a survey and its photos (including after-photos) |
+| POST | `/api/admin/rebuild-index` | admin: rebuild `index/surveys.json` and `index/stretches.json` from the record files |
 
 **Data safety:** every survey is stored as its own JSON file (`surveys/<id>.json`). The combined `index/surveys.json`, used for fast
 dashboard loading, is updated with an R2 conditional write (ETag), so simultaneous submissions from many surveyors never overwrite
@@ -148,9 +161,14 @@ web/                    static PWA (GitHub Pages)
   js/config.js          API_BASE + titles
   js/masters.js         generated from Excel (SUBSTATION + POLE sheets)
   js/catalog.js         irregularities, material catalogue, validation (shared with Worker)
-  js/survey.js          survey form, GPS, photo stamping
+  js/survey.js          survey form, stretch, GPS, photo stamping
+  js/i18n.js            English / Hindi texts and switch
   js/dashboard.js       dashboard
-  js/report.js          report list, PDF and CSV generation
+  js/report.js          report list, material summary, rectification, Excel / CSV / PDF
+  js/pdf-stretch.js     one-page stretch PDF (with plan of points)
+  js/pdfutil.js         shared PDF drawing helpers
+  js/editor.js          admin edit dialogs (survey, stretch)
+  js/filters.js         filter bar shared by Dashboard and Report
   js/api.js, db.js      server calls, offline outbox (IndexedDB)
 worker/                 Cloudflare Worker (R2 storage API)
 tools/                  Excel → masters.js converter + source Excel

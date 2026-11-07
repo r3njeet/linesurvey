@@ -1,11 +1,17 @@
 import { HIERARCHY, LINES33 } from './masters.js';
-import { IRREGULARITIES, MATERIALS, MATERIAL_CATS, MIN_PHOTOS, MAX_PHOTOS, validateSurvey, validateStretch, subdivisionOfSubstation } from './catalog.js';
-import { $, $$, esc, toast, uid, stampPhoto, fmtDateTime, fmtLatLng, optionList, shortName } from './util.js';
-import { getSettings, queueSurvey, queueStretch, outboxItems, discardOutbox, bus, sync } from './api.js';
+import { IRREGULARITIES, MATERIALS, MATERIAL_CATS, MIN_PHOTOS, MAX_PHOTOS, validateSurvey, validateStretch, subdivisionOfSubstation,
+  lineVoltageOf, lineTitle, appliesTo, allowedVariants, irregularityName } from './catalog.js';
+import { $, $$, esc, toast, uid, stampPhoto, fmtDateTime, fmtDate, fmtLatLng, optionList, shortName, distanceM } from './util.js';
+import { getSettings, queueSurvey, queueStretch, listStretches, listSurveys, outboxItems, discardOutbox, bus, sync } from './api.js';
+import { t, L, ph, applyLang } from './i18n.js';
 
 const LAST_SEL = 'ls.lastSelection';
 const STRETCH_KEY = 'ls.stretch';
-let root, st, lastFix = null, gpsState = 'idle', gpsText = '', watchId = null;
+const FAR_KM = 15;      // an end point / survey further than this from the stretch start is probably a mistake
+const DUP_M = 25;       // a survey with the same problem this close to an existing one is probably a duplicate
+const LONG_OPEN_H = 24; // a stretch open longer than this gets a reminder
+let root, st, lastFix = null, gpsState = 'idle', gpsMsg = { k: 'GPS: starting…' }, watchId = null;
+let openStretches = []; // open stretches of every surveyor (so one started on another phone can be continued)
 // The open "survey stretch": { rec: stretch record, sel: line selection it belongs to, count: surveys recorded in it }.
 // It lives in localStorage so it survives closing the app: the end point is usually entered after the survey.
 let stretch = null, sxStart = '', sxEnd = '';
@@ -29,24 +35,27 @@ export function initSurvey(el) {
   if (stretch && !lineComplete()) { stretch = null; saveStretchLS(); }   // its line no longer exists in the masters
   applyStretchLock();
   renderStretch();
+  refreshOpenStretches();
   startGPS();
   renderOutbox();
   bus.addEventListener('outbox', renderOutbox);
+  bus.addEventListener('data', refreshOpenStretches);
+  window.addEventListener('langchange', () => { applyLang(root); renderStretch(); renderPhotos(); renderOutbox(); paintGps(); refreshIrregCount(); });
   window.addEventListener('beforeunload', (e) => { if (st.photos.length) { e.preventDefault(); e.returnValue = ''; } });
 }
 
 function template() {
   const irr = IRREGULARITIES.map(d => `
     <div class="irr" data-code="${d.code}">
-      <label class="irr-head"><input type="checkbox" class="irr-cb"><span class="box" aria-hidden="true"></span><span>${esc(d.label)}</span>
+      <label class="irr-head"><input type="checkbox" class="irr-cb"><span class="box" aria-hidden="true"></span>${L(d.label)}
         ${d.variants ? `<em class="tag">${d.variants.join(' / ')}</em>` : ''}</label>
-      ${d.variants ? `<div class="irr-sub" hidden><span class="sub-lbl">Line:</span>${d.variants.map(v =>
-        `<label class="chip"><input type="checkbox" value="${esc(v)}"><span>${esc(v)}</span></label>`).join('')}</div>` : ''}
-      ${d.needsText ? `<div class="irr-sub" hidden><input type="text" class="irr-text" maxlength="300" placeholder="Describe the irregularity"></div>` : ''}
+      ${d.variants ? `<div class="irr-sub" hidden><span class="sub-lbl">${L('Line:')}</span>${d.variants.map(v =>
+        `<label class="chip" data-v="${esc(v)}"><input type="checkbox" value="${esc(v)}"><span>${esc(v)}</span></label>`).join('')}</div>` : ''}
+      ${d.needsText ? `<div class="irr-sub" hidden><input type="text" class="irr-text" maxlength="300" ${ph('Describe the irregularity')}></div>` : ''}
     </div>`).join('');
 
   const mats = MATERIAL_CATS.map(cat => `
-    <fieldset class="mat-group"><legend>${esc(cat)}</legend>
+    <fieldset class="mat-group"><legend>${L(cat)}</legend>
       ${MATERIALS.filter(m => m.cat === cat).map(m => `
         <div class="mat-row" data-id="${m.id}">
           <span class="mat-name">${esc(m.cat === 'Pole' ? m.item : m.item.replace(cat + ' ', ''))}</span>
@@ -55,7 +64,7 @@ function template() {
             <input type="number" inputmode="decimal" min="0" step="${m.unit === 'm' ? '1' : '1'}" placeholder="0" aria-label="${esc(m.item)} quantity">
             <button type="button" class="step-btn" data-d="1" aria-label="Increase">+</button>
           </div>
-          <span class="unit">${m.unit === 'm' ? 'metre' : 'nos'}</span>
+          <span class="unit">${L(m.unit === 'm' ? 'metre' : 'nos')}</span>
         </div>`).join('')}
     </fieldset>`).join('');
 
@@ -63,73 +72,73 @@ function template() {
   <div id="sv-outbox"></div>
   <form id="sv-form" novalidate autocomplete="off">
     <section class="card step" id="st-1">
-      <h2><span class="num">1</span>Line details</h2>
-      <p class="hint">Which line are you surveying?</p>
+      <h2><span class="num">1</span>${L('Line details')}</h2>
+      <p class="hint">${L('Which line are you surveying?')}</p>
       <fieldset class="plain" id="line-fs">
       <div class="seg" role="radiogroup" aria-label="Line type">
-        <label><input type="radio" name="linetype" value="11 kV"><span>11 kV line</span></label>
-        <label><input type="radio" name="linetype" value="33 kV"><span>33 kV line</span></label>
+        <label><input type="radio" name="linetype" value="11 kV"><span>${L('11 kV line')}</span></label>
+        <label><input type="radio" name="linetype" value="33 kV"><span>${L('33 kV line')}</span></label>
       </div>
 
       <div id="lt-11" class="grid3 lt-block" hidden>
-        <label class="fld">Subdivision<select id="sv-sd">${optionList(Object.keys(HIERARCHY), 'Select subdivision')}</select></label>
-        <label class="fld">Substation<select id="sv-ss" disabled><option value="">Select substation</option></select></label>
-        <label class="fld">Feeder<select id="sv-fd" disabled><option value="">Select feeder</option></select></label>
+        <label class="fld">${L('Subdivision')}<select id="sv-sd">${optionList(Object.keys(HIERARCHY), 'Select subdivision')}</select></label>
+        <label class="fld">${L('Substation')}<select id="sv-ss" disabled>${optionList([], 'Select substation')}</select></label>
+        <label class="fld">${L('Feeder')}<select id="sv-fd" disabled>${optionList([], 'Select feeder')}</select></label>
       </div>
 
       <div id="lt-33" class="grid3 lt-block" hidden>
-        <label class="fld">Primary Substation<select id="sv-ps">${optionList(Object.keys(LINES33), 'Select primary substation')}</select></label>
-        <label class="fld">33 kV Line<select id="sv-l33" disabled><option value="">Select 33 kV line</option></select></label>
-        <label class="fld">Section<select id="sv-sec" disabled><option value="">Select section</option></select></label>
-        <label class="fld">Substation<select id="sv-ss33" disabled><option value="">Select substation</option></select></label>
-        <label class="fld">Subdivision <span class="opt">(filled automatically)</span><input id="sv-sd33" readonly tabindex="-1" placeholder="Select a substation"></label>
+        <label class="fld">${L('Primary Substation')}<select id="sv-ps">${optionList(Object.keys(LINES33), 'Select primary substation')}</select></label>
+        <label class="fld">${L('33 kV Line')}<select id="sv-l33" disabled>${optionList([], 'Select 33 kV line')}</select></label>
+        <label class="fld">${L('Section')}<select id="sv-sec" disabled>${optionList([], 'Select section')}</select></label>
+        <label class="fld">${L('Substation')}<select id="sv-ss33" disabled>${optionList([], 'Select substation')}</select></label>
+        <label class="fld">${L('Subdivision')} <span class="opt">${L('(filled automatically)')}</span><input id="sv-sd33" readonly tabindex="-1" ${ph('Select a substation')}></label>
       </div>
       </fieldset>
-      <p class="lock-note" id="line-lock-note" hidden>Line details are locked while a survey stretch is open. End the stretch (step 2) to survey another line.</p>
+      <p class="lock-note" id="line-lock-note" hidden>${L('Line details are locked while a survey stretch is open. End the stretch (step 2) to survey another line.')}</p>
     </section>
 
     <section class="card step" id="st-sx">
-      <h2><span class="num">2</span>Survey stretch <small id="sx-state"></small></h2>
+      <h2><span class="num">2</span>${L('Survey stretch')} <small id="sx-state"></small></h2>
       <div id="sx-body"></div>
     </section>
 
     <section class="card step" id="st-2">
-      <h2><span class="num">3</span>Irregularities found <small id="irr-count"></small></h2>
-      <p class="hint">Tick every problem seen at this pole / span. For line problems choose the voltage level.</p>
+      <h2><span class="num">3</span>${L('Irregularities found')} <small id="irr-count"></small></h2>
+      <p class="hint">${L('Tick every problem seen at this pole / span. For line problems choose the voltage level.')}</p>
       <div class="irr-list">${irr}</div>
     </section>
 
     <section class="card step" id="st-3">
-      <h2><span class="num">4</span>Photographs <small id="ph-count">0 / min ${MIN_PHOTOS}</small></h2>
-      <div class="gps-line"><span id="sv-gps" class="gps gps-live idle">GPS: starting…</span></div>
-      <p class="lock-msg" id="ph-lock">Complete the Line details (step 1) before taking photographs.</p>
+      <h2><span class="num">4</span>${L('Photographs')} <small id="ph-count"></small></h2>
+      <div class="gps-line"><span id="sv-gps" class="gps gps-live idle"></span></div>
+      <p class="lock-msg" id="ph-lock"></p>
       <div class="photo-grid" id="ph-grid"></div>
       <input type="file" id="sv-cam" accept="image/*" capture="environment" hidden>
     </section>
 
     <section class="card step" id="st-4">
-      <h2><span class="num">5</span>Location &amp; landmark</h2>
-      <label class="fld"><span>Location <b class="req">*</b></span><textarea id="sv-loc" rows="2" maxlength="500" placeholder="Village / mohalla / pole no. / span between poles"></textarea></label>
-      <label class="fld"><span>Landmark <b class="req">*</b></span><input type="text" id="sv-lmk" maxlength="500" placeholder="e.g. Near Shiv Mandir, opposite primary school"></label>
-      <label class="fld"><span>Remarks <span class="opt">(optional)</span></span><input type="text" id="sv-rmk" maxlength="1000"></label>
+      <h2><span class="num">5</span>${L('Location & landmark')}</h2>
+      <label class="fld"><span>${L('Location')} <b class="req">*</b></span><textarea id="sv-loc" rows="2" maxlength="500" ${ph('Village / mohalla / pole no. / span between poles')}></textarea></label>
+      <label class="fld"><span>${L('Landmark')} <b class="req">*</b></span><input type="text" id="sv-lmk" maxlength="500" ${ph('e.g. Near Shiv Mandir, opposite primary school')}></label>
+      <label class="fld"><span>${L('Remarks')} <span class="opt">${L('(optional)')}</span></span><input type="text" id="sv-rmk" maxlength="1000"></label>
     </section>
 
     <section class="card step" id="st-5">
-      <h2><span class="num">6</span>Material required to rectify?</h2>
+      <h2><span class="num">6</span>${L('Material required to rectify?')}</h2>
       <div class="seg" role="radiogroup">
-        <label><input type="radio" name="matreq" value="yes"><span>Yes</span></label>
-        <label><input type="radio" name="matreq" value="no"><span>No</span></label>
+        <label><input type="radio" name="matreq" value="yes"><span>${L('Yes')}</span></label>
+        <label><input type="radio" name="matreq" value="no"><span>${L('No')}</span></label>
       </div>
       <div id="mat-box" hidden>
-        <p class="hint">Enter quantity against each item needed (poles &amp; insulators in numbers, conductor &amp; cable in metres).</p>
+        <p class="hint">${L('Enter quantity against each item needed (poles & insulators in numbers, conductor & cable in metres).')}</p>
         <div class="mat-grid">${mats}</div>
       </div>
     </section>
 
     <div id="sv-errors" class="errors" hidden></div>
     <div class="submit-bar">
-      <button type="button" class="btn ghost" id="sv-reset">Clear</button>
-      <button type="submit" class="btn primary big" id="sv-submit">Submit survey</button>
+      <button type="button" class="btn ghost" id="sv-reset">${L('Clear')}</button>
+      <button type="submit" class="btn primary big" id="sv-submit">${L('Submit survey')}</button>
     </div>
   </form>`;
 }
@@ -186,18 +195,18 @@ function wire() {
       if (cb.checked) st.irregs.set(code, { voltages: new Set(), text: '' });
       else st.irregs.delete(code);
       box.classList.toggle('on', cb.checked);
-      if (sub) sub.hidden = !cb.checked;
       if (!cb.checked && sub) $$('input', sub).forEach(i => { i.type === 'checkbox' ? (i.checked = false) : (i.value = ''); });
-      if (cb.checked && sub) { const t = $('.irr-text', sub); if (t) t.focus(); }
-      $('#irr-count').textContent = st.irregs.size ? `${st.irregs.size} selected` : '';
+      syncIrreg(box);
+      if (cb.checked && sub) { const tx = $('.irr-text', sub); if (tx) tx.focus(); }
+      refreshIrregCount();
     });
     if (sub) {
       $$('input[type=checkbox]', sub).forEach(c => c.addEventListener('change', () => {
         const s = st.irregs.get(code); if (!s) return;
         c.checked ? s.voltages.add(c.value) : s.voltages.delete(c.value);
       }));
-      const t = $('.irr-text', sub);
-      if (t) t.addEventListener('input', () => { const s = st.irregs.get(code); if (s) s.text = t.value; });
+      const tx = $('.irr-text', sub);
+      if (tx) tx.addEventListener('input', () => { const s = st.irregs.get(code); if (s) s.text = tx.value; });
     }
   });
 
@@ -213,8 +222,8 @@ function wire() {
       return;
     }
     if (e.target.closest('#ph-add')) {
-      if (!lineComplete()) { toast('Complete the Line details (step 1) first', 'err'); return; }
-      if (!stretch) { toast('Start the survey stretch (step 2) first', 'err'); return; }
+      if (!lineComplete()) { toast(t('Complete the Line details (step 1) first'), 'err'); return; }
+      if (!stretch) { toast(t('Start the survey stretch (step 2) first'), 'err'); return; }
       $('#sv-cam').click();
     }
   });
@@ -240,6 +249,7 @@ function wire() {
     const b = e.target.closest('button'); if (!b) return;
     if (b.id === 'sx-start') startStretch(b);
     if (b.id === 'sx-end') endStretch(b);
+    if (b.dataset.resume) resumeStretch(b.dataset.resume);
   });
 
   $('#sv-form').addEventListener('submit', onSubmit);
@@ -249,8 +259,54 @@ function wire() {
   renderPhotos();
 }
 
+const defOf = (box) => IRREGULARITIES.find(d => d.code === box.dataset.code);
+const refreshIrregCount = () => { $('#irr-count').textContent = st.irregs.size ? t('{n} selected', { n: st.irregs.size }) : ''; };
+
+/** Voltages the surveyor must choose between for this irregularity on the chosen line (null = no voltage question). */
+function variantsOnLine(def) {
+  if (!def.variants) return null;
+  const lv = lineType();
+  return lv ? allowedVariants(def, lv) : def.variants;
+}
+
+/** Show / hide the voltage chips of one irregularity; a single possible voltage is filled in automatically. */
+function syncIrreg(box) {
+  const def = defOf(box), sub = $('.irr-sub', box), s = st.irregs.get(def.code);
+  if (!sub) return;
+  if (def.variants) {
+    const allowed = variantsOnLine(def);
+    const single = !!lineType() && allowed.length === 1;
+    $$('.chip', sub).forEach(c => {
+      const ok = allowed.includes(c.dataset.v);
+      c.hidden = !ok;
+      if (!ok) { const i = $('input', c); if (i.checked) { i.checked = false; if (s) s.voltages.delete(c.dataset.v); } }
+    });
+    if (s && single) s.voltages = new Set(allowed);
+    sub.hidden = !s || single;
+    const tag = $('.tag', box); if (tag) tag.textContent = allowed.join(' / ');
+  } else {
+    sub.hidden = !s;
+  }
+}
+
+/** Only offer the irregularities that make sense on the chosen line (33 kV: no LT items; 11 kV: no 33 kV variants). */
+function applyLineToIrregs() {
+  const lv = lineType();
+  $$('.irr', root).forEach(box => {
+    const def = defOf(box);
+    const show = !lv || appliesTo(def, lv);
+    box.hidden = !show;
+    if (!show) {
+      const cb = $('.irr-cb', box);
+      if (cb.checked) { cb.checked = false; cb.dispatchEvent(new Event('change')); }
+      return;
+    }
+    syncIrreg(box);
+  });
+}
+
 function confirmLoss() {
-  return !(st.photos.length || st.irregs.size) || window.confirm('Clear this survey? Photos and entries will be lost.');
+  return !(st.photos.length || st.irregs.size) || window.confirm(t('Clear this survey? Photos and entries will be lost.'));
 }
 
 const lineType = () => ($('input[name=linetype]:checked') || {}).value || '';
@@ -272,6 +328,7 @@ const currentSel = () => ({
 
 function selectionChanged() {
   localStorage.setItem(LAST_SEL, JSON.stringify(currentSel()));
+  applyLineToIrregs();
   renderPhotos();
   renderStretch();
 }
@@ -301,18 +358,18 @@ function startGPS() {
   if (!('geolocation' in navigator)) { setGps('err', 'GPS not supported on this device'); return; }
   setGps('wait', 'GPS: acquiring location…');
   watchId = navigator.geolocation.watchPosition(
-    (p) => { lastFix = toFix(p); setGps(lastFix.acc <= 30 ? 'ok' : 'weak', `GPS ±${Math.round(lastFix.acc)} m · ${lastFix.lat.toFixed(5)}, ${lastFix.lng.toFixed(5)}`); },
+    (p) => { lastFix = toFix(p); setGps(lastFix.acc <= 30 ? 'ok' : 'weak', 'GPS ±{acc} m · {lat}, {lng}', { acc: Math.round(lastFix.acc), lat: lastFix.lat.toFixed(5), lng: lastFix.lng.toFixed(5) }); },
     (err) => setGps('err', err.code === 1 ? 'Location permission denied — allow location for this site' : 'GPS: no signal, move to open sky'),
     { enableHighAccuracy: true, maximumAge: 10000, timeout: 30000 });
 }
 const toFix = (p) => ({ lat: p.coords.latitude, lng: p.coords.longitude, acc: p.coords.accuracy, t: p.timestamp || Date.now() });
-function setGps(state, text) {
-  gpsState = state; gpsText = text;
+function setGps(state, key, vars) {
+  gpsState = state; gpsMsg = { k: key, v: vars };
   paintGps();
 }
 /** The GPS status pill appears in the stretch card and in the photo card. */
 function paintGps() {
-  $$('.gps-live', root).forEach(g => { g.className = `gps gps-live ${gpsState}`; g.textContent = gpsText; });
+  $$('.gps-live', root).forEach(g => { g.className = `gps gps-live ${gpsState}`; g.textContent = t(gpsMsg.k, gpsMsg.v); });
 }
 function getFix(maxAge = 60000) {
   if (lastFix && Date.now() - lastFix.t < maxAge) return Promise.resolve(lastFix);
@@ -327,8 +384,8 @@ async function onPhoto(e) {
   const file = e.target.files[0];
   e.target.value = '';
   if (!file) return;
-  if (st.photos.length >= MAX_PHOTOS) { toast(`Maximum ${MAX_PHOTOS} photographs`, 'err'); return; }
-  const tile = $('#ph-add'); tile.classList.add('busy'); tile.querySelector('span').textContent = 'Getting GPS…';
+  if (st.photos.length >= MAX_PHOTOS) { toast(t('Maximum {n} photographs', { n: MAX_PHOTOS }), 'err'); return; }
+  const tile = $('#ph-add'); tile.classList.add('busy'); tile.querySelector('span').textContent = t('Getting GPS…');
   try {
     const fix = await getFix();
     const s = getSettings();
@@ -352,10 +409,10 @@ async function onPhoto(e) {
 function renderPhotos() {
   const locked = !lineComplete() || !stretch;
   $('#ph-lock').hidden = !locked;
-  $('#ph-lock').textContent = !lineComplete() ? 'Complete the Line details (step 1) before taking photographs.'
-    : 'Start the survey stretch (step 2) before taking photographs.';
+  $('#ph-lock').textContent = !lineComplete() ? t('Complete the Line details (step 1) before taking photographs.')
+    : t('Start the survey stretch (step 2) before taking photographs.');
   const n = st.photos.length;
-  $('#ph-count').textContent = `${n} / min ${MIN_PHOTOS}`;
+  $('#ph-count').textContent = t('{n} / min {min}', { n, min: MIN_PHOTOS });
   $('#ph-count').className = n >= MIN_PHOTOS ? 'good' : '';
   $('#ph-grid').innerHTML = st.photos.map((p, i) => `
     <figure class="ph"><img src="${p.url}" alt="Photo ${i + 1}">
@@ -363,7 +420,7 @@ function renderPhotos() {
       <button type="button" class="ph-rm" data-rm="${i}" aria-label="Remove photo ${i + 1}">×</button></figure>`).join('') +
     (n < MAX_PHOTOS ? `<button type="button" class="ph add ${locked ? 'locked' : ''}" id="ph-add">
       <svg viewBox="0 0 24 24" width="30" height="30" aria-hidden="true"><path fill="currentColor" d="M9 3 7.2 5H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-3.2L15 3H9zm3 5a5 5 0 1 1 0 10 5 5 0 0 1 0-10zm0 2a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/></svg>
-      <span>${n ? 'Take another' : 'Take photo'}</span></button>` : '');
+      <span>${t(n ? 'Take another' : 'Take photo')}</span></button>` : '');
 }
 
 /* ---------------- submit ---------------- */
@@ -399,6 +456,20 @@ function buildRecord() {
   };
 }
 
+/** Existing surveys (server copy, this phone's pending ones) that report the same problem within DUP_M of this one. */
+async function findDuplicates(rec) {
+  if (!rec.gps) return [];
+  let list = [];
+  try { list = (await Promise.race([listSurveys({ fresh: true }), new Promise((_, no) => setTimeout(() => no(new Error('slow')), 4000))])).surveys; }
+  catch { try { list = (await listSurveys()).surveys; } catch { list = []; } }
+  const pending = (await outboxItems().catch(() => [])).map(x => x.record);
+  const keys = new Set(rec.irregularities.filter(i => i.code !== 'OTHER').map(i => `${i.code}|${i.voltage || ''}`));
+  if (!keys.size) return [];
+  return [...list, ...pending]
+    .filter(x => x.id !== rec.id && !x.rectified && x.gps && distanceM(rec.gps, x.gps) <= DUP_M && x.irregularities.some(i => keys.has(`${i.code}|${i.voltage || ''}`)))
+    .map(x => ({ x, d: Math.round(distanceM(rec.gps, x.gps)) })).sort((p, q) => p.d - q.d).slice(0, 3);
+}
+
 async function onSubmit(e) {
   e.preventDefault();
   const rec = buildRecord();
@@ -408,20 +479,30 @@ async function onSubmit(e) {
     errors.unshift('Choose the line you are surveying: 11 kV or 33 kV');
   }
   if (!stretch) errors.unshift('Start the survey stretch (step 2): enter the starting point first');
-  if (st.photos.length < MIN_PHOTOS) errors.push(`Take at least ${MIN_PHOTOS} photographs`);
-  if (rec.materialRequired === null) { errors.splice(errors.indexOf('Choose whether material is required'), 1); errors.push('Choose whether material is required (Yes / No)'); }
+  if (st.photos.length < MIN_PHOTOS) errors.push('Take at least 2 photographs');
+  if (rec.materialRequired === null) { const i = errors.indexOf('Choose whether material is required'); if (i >= 0) errors.splice(i, 1); errors.push('Choose whether material is required (Yes / No)'); }
   const box = $('#sv-errors');
   if (errors.length) {
     box.hidden = false;
-    box.innerHTML = `<strong>Please fix before submitting:</strong><ul>${errors.map(x => `<li>${esc(x)}</li>`).join('')}</ul>`;
+    box.innerHTML = `<strong>${esc(t('Please fix before submitting:'))}</strong><ul>${errors.map(x => `<li>${esc(t(x))}</li>`).join('')}</ul>`;
     box.scrollIntoView({ behavior: 'smooth', block: 'center' });
     return;
   }
   box.hidden = true;
   const btn = $('#sv-submit'); btn.disabled = true;
   try {
+    // warnings: ask, never block
+    if (stretch && rec.gps) {
+      const km = distanceM(rec.gps, stretch.rec.start.gps) / 1000;
+      if (km > FAR_KM && !confirm(t('This survey location is {km} km from the stretch start point. Submit anyway?', { km: km.toFixed(1) }))) return;
+    }
+    const dups = await findDuplicates(rec);
+    if (dups.length) {
+      const list = dups.map(({ x, d }) => `• ${x.ref || '(on this phone)'} · ${x.irregularities.map(irregularityName).join(', ')} · ${d} m · ${fmtDate(x.capturedAt || x.createdAt)}${x.surveyor?.name ? ' · ' + x.surveyor.name : ''}`).join('\n');
+      if (!confirm(t('Possible duplicate: a survey with the same problem was already recorded within {m} m of here:\n\n{list}\n\nSubmit anyway?', { m: DUP_M, list }))) return;
+    }
     await queueSurvey(rec, st.photos.map(p => p.blob));
-    toast(navigator.onLine ? 'Survey saved — uploading…' : 'Saved offline — will upload when online', 'ok');
+    toast(t(navigator.onLine ? 'Survey saved — uploading…' : 'Saved offline — will upload when online'), 'ok');
     if (stretch) { stretch.count++; saveStretchLS(); renderStretch(); }
     resetForm();
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -433,8 +514,8 @@ async function onSubmit(e) {
 function resetForm() {
   st.photos.forEach(p => URL.revokeObjectURL(p.url));
   st = freshState();
-  $$('.irr', root).forEach(b => { b.classList.remove('on'); $$('input', b).forEach(i => { i.type === 'checkbox' ? (i.checked = false) : (i.value = ''); }); $$('.irr-sub', b).forEach(s => (s.hidden = true)); });
-  $('#irr-count').textContent = '';
+  $$('.irr', root).forEach(b => { b.classList.remove('on'); $$('input', b).forEach(i => { i.type === 'checkbox' ? (i.checked = false) : (i.value = ''); }); $$('.irr-sub', b).forEach(x => (x.hidden = true)); });
+  refreshIrregCount();
   ['#sv-loc', '#sv-lmk', '#sv-rmk'].forEach(s => ($(s).value = ''));
   $$('input[name=matreq]').forEach(r => (r.checked = false));
   $$('.mat-row input').forEach(i => (i.value = ''));
@@ -456,43 +537,77 @@ function applyStretchLock() {
 }
 const pointOf = (location, fix) => ({ location, gps: { lat: fix.lat, lng: fix.lng, acc: fix.acc }, at: new Date().toISOString() });
 
+const sameLine = (a, b) => lineVoltageOf(a) === lineVoltageOf(b)
+  && (lineVoltageOf(a) === '33 kV' ? a.line33 === b.line33 && a.section === b.section : a.feeder === b.feeder);
+const hoursSince = (iso) => (Date.now() - new Date(iso).getTime()) / 3600000;
+
+/** Open stretches of everybody, newest first: lets a stretch started on another phone be continued and ended here. */
+async function refreshOpenStretches() {
+  let all = null;
+  try { all = await listStretches({ fresh: true }); openStretches = all.filter(x => !x.end).sort((p, q) => (q.seq || 0) - (p.seq || 0)); }
+  catch { openStretches = []; }
+  // finished on another phone meanwhile: stop carrying it here
+  const done = stretch && all && all.find(x => x.id === stretch.rec.id && x.end);
+  if (done) {
+    stretch = null; saveStretchLS(); sxStart = ''; sxEnd = '';
+    applyStretchLock(); renderPhotos();
+    toast(t('This stretch was ended on another phone'), 'ok', 5000);
+  }
+  if (!stretch || done) renderStretch();
+}
+
 function renderStretch() {
   const body = $('#sx-body'); if (!body) return;
   const badge = $('#sx-state');
   if (!stretch) {
     badge.textContent = ''; badge.className = '';
-    body.innerHTML = lineComplete() ? `
-      <p class="hint">Where does this stretch of line begin? Type the starting point. GPS is captured automatically when you tap the button.</p>
-      <label class="fld"><span>Start point <b class="req">*</b></span>
-        <textarea id="sx-start-loc" rows="2" maxlength="500" placeholder="Pole no. / village / landmark where the survey starts">${esc(sxStart)}</textarea></label>
+    const startForm = lineComplete() ? `
+      <p class="hint">${esc(t('Where does this stretch of line begin? Type the starting point. GPS is captured automatically when you tap the button.'))}</p>
+      <label class="fld"><span>${esc(t('Start point'))} <b class="req">*</b></span>
+        <textarea id="sx-start-loc" rows="2" maxlength="500" placeholder="${esc(t('Pole no. / village / landmark where the survey starts'))}">${esc(sxStart)}</textarea></label>
       <div class="gps-line"><span class="gps gps-live idle"></span></div>
-      <button type="button" class="btn primary block" id="sx-start">Start survey from here</button>`
-      : `<p class="lock-msg">Complete the Line details (step 1) first.</p>`;
+      <button type="button" class="btn primary block" id="sx-start">${esc(t('Start survey from here'))}</button>`
+      : `<p class="lock-msg">${esc(t('Complete the Line details (step 1) first.'))}</p>`;
+    const open = openStretches.slice(0, 8);
+    const openList = open.length ? `
+      <div class="sx-others">
+        <h3>${esc(t('Open stretches'))} <small class="muted">${openStretches.length}</small></h3>
+        <p class="hint">${esc(t('Started on another phone? Tap Continue to carry on with it or to finish it.'))}</p>
+        ${open.map(x => `<div class="sx-oitem"><div><b>${esc(x.ref)}</b> <b class="lv lv${lineVoltageOf(x) === '33 kV' ? '33' : '11'}">${lineVoltageOf(x)}</b> ${esc(lineTitle(x))}<br>
+          <small class="muted">${esc(x.start.location)} · ${esc(x.surveyor?.name || '')} · ${fmtDateTime(x.start.at)}</small></div>
+          <button type="button" class="btn small" data-resume="${esc(x.id)}">${esc(t('Continue'))}</button></div>`).join('')}
+      </div>` : '';
+    body.innerHTML = startForm + openList;
   } else {
     const r = stretch.rec, n = stretch.count || 0;
-    badge.textContent = 'in progress'; badge.className = 'good';
+    badge.textContent = t('in progress'); badge.className = 'good';
+    const hrs = hoursSince(r.start.at);
     body.innerHTML = `
       <div class="sx-open">
-        <div class="sx-pt"><b>Start point</b><span>${esc(r.start.location)}</span>
+        <div class="sx-pt"><b>${esc(t('Start point'))}${r.ref ? ' · ' + esc(r.ref) : ''}</b><span>${esc(r.start.location)}</span>
           <small>${fmtLatLng(r.start.gps)} ±${Math.round(r.start.gps.acc || 0)} m · ${fmtDateTime(r.start.at)}</small></div>
-        <div class="sx-meta">${n} survey${n === 1 ? '' : 's'} recorded in this stretch</div>
+        <div class="sx-meta">${esc(t(n === 1 ? '{n} survey recorded in this stretch' : '{n} surveys recorded in this stretch', { n }))}</div>
       </div>
-      <p class="hint">Record the irregularities below as you walk the line. When you reach the end, enter the end point. You can do this after the survey, even later.</p>
-      <label class="fld"><span>End point <span class="opt">(fill after finishing the survey)</span></span>
-        <textarea id="sx-end-loc" rows="2" maxlength="500" placeholder="Pole no. / village / landmark where the survey ends">${esc(sxEnd)}</textarea></label>
+      ${hrs > LONG_OPEN_H ? `<p class="lock-msg">${esc(t('This stretch has been open for {h} hours. If the survey is finished, enter the end point.', { h: Math.round(hrs) }))}</p>` : ''}
+      <p class="hint">${esc(t('Record the irregularities below as you walk the line. When you reach the end, enter the end point. You can do this after the survey, even later.'))}</p>
+      <label class="fld"><span>${esc(t('End point'))} <span class="opt">${esc(t('(fill after finishing the survey)'))}</span></span>
+        <textarea id="sx-end-loc" rows="2" maxlength="500" placeholder="${esc(t('Pole no. / village / landmark where the survey ends'))}">${esc(sxEnd)}</textarea></label>
       <div class="gps-line"><span class="gps gps-live idle"></span></div>
-      <button type="button" class="btn block" id="sx-end">End survey here</button>`;
+      <button type="button" class="btn block" id="sx-end">${esc(t('End survey here'))}</button>`;
   }
   paintGps();
 }
 
 async function startStretch(btn) {
   const loc = sxStart.trim();
-  if (!loc) { toast('Enter the starting point', 'err'); $('#sx-start-loc').focus(); return; }
-  btn.disabled = true; btn.textContent = 'Getting GPS…';
+  if (!loc) { toast(t('Enter the starting point'), 'err'); $('#sx-start-loc').focus(); return; }
+  const here = lineFields();
+  const clash = openStretches.find(x => sameLine(x, here));
+  if (clash && !confirm(t('An open stretch is already running on this line: {info}.\n\nStart another one anyway?', { info: `${clash.ref} · ${clash.start.location} · ${clash.surveyor?.name || ''} · ${fmtDateTime(clash.start.at)}` }))) return;
+  btn.disabled = true; btn.textContent = t('Getting GPS…');
   try {
     const fix = await getFix(15000);
-    const rec = { id: uid(), surveyor: { name: getSettings().name || '' }, ...lineFields(), start: pointOf(loc, fix), end: null };
+    const rec = { id: uid(), surveyor: { name: getSettings().name || '' }, ...here, start: pointOf(loc, fix), end: null };
     const errs = validateStretch(rec, HIERARCHY);
     if (errs.length) throw new Error(errs[0]);
     await queueStretch(rec);
@@ -501,29 +616,53 @@ async function startStretch(btn) {
     sxStart = ''; sxEnd = '';
     applyStretchLock();
     renderPhotos();
-    toast('Survey started. Start point saved with GPS', 'ok');
+    toast(t('Survey started. Start point saved with GPS'), 'ok');
   } catch (err) {
     toast(err.message, 'err', 5000);
   } finally { renderStretch(); }
 }
 
+/** Selection object (as saved in localStorage) for the line of a stretch record. */
+const selOfStretch = (r) => (lineVoltageOf(r) === '33 kV'
+  ? { lt: '33 kV', ps: r.primarySubstation, l33: r.line33, sec: r.section, ss33: r.substation }
+  : { lt: '11 kV', sd: r.subdivision, ss: r.substation, fd: r.feeder });
+
+/** Take over an open stretch (started on this or another phone): load its line, lock it, carry on surveying or end it. */
+async function resumeStretch(id) {
+  const rec = openStretches.find(x => x.id === id);
+  if (!rec || stretch) return;
+  restoreSelection(selOfStretch(rec));
+  if (!lineComplete() || lineType() !== lineVoltageOf(rec)) { toast(t('Could not load the line of this stretch'), 'err'); return; }
+  let n = 0;
+  try { n = (await listSurveys()).surveys.filter(x => x.stretchId === id).length; } catch {}
+  stretch = { rec, sel: currentSel(), count: n };
+  saveStretchLS();
+  sxStart = ''; sxEnd = '';
+  applyStretchLock();
+  renderPhotos();
+  renderStretch();
+}
+
 async function endStretch(btn) {
   const loc = sxEnd.trim();
-  if (!loc) { toast('Enter the end point', 'err'); $('#sx-end-loc').focus(); return; }
-  if (st.photos.length || st.irregs.size) { toast('Submit or clear the survey you are filling in before ending the stretch', 'err', 5000); return; }
-  if (!stretch.count && !confirm('No irregularity has been recorded in this stretch. End it anyway?')) return;
-  btn.disabled = true; btn.textContent = 'Getting GPS…';
+  if (!loc) { toast(t('Enter the end point'), 'err'); $('#sx-end-loc').focus(); return; }
+  if (st.photos.length || st.irregs.size) { toast(t('Submit or clear the survey you are filling in before ending the stretch'), 'err', 5000); return; }
+  if (!stretch.count && !confirm(t('No irregularity has been recorded in this stretch. End it anyway?'))) return;
+  btn.disabled = true; btn.textContent = t('Getting GPS…');
   try {
     const fix = await getFix(15000);
+    const km = distanceM(fix, stretch.rec.start.gps) / 1000;
+    if (km > FAR_KM && !confirm(t('The end point is {km} km from the start point. Is that right?', { km: km.toFixed(1) }))) return;
     const rec = { ...stretch.rec, end: pointOf(loc, fix) };
     const errs = validateStretch(rec, HIERARCHY);
     if (errs.length) throw new Error(errs[0]);
     await queueStretch(rec);
+    openStretches = openStretches.filter(x => x.id !== rec.id);
     stretch = null; saveStretchLS();
     sxStart = ''; sxEnd = '';
     applyStretchLock();
     renderPhotos();
-    toast('Survey stretch completed. End point saved with GPS', 'ok');
+    toast(t('Survey stretch completed. End point saved with GPS'), 'ok');
     window.scrollTo({ top: 0, behavior: 'smooth' });
   } catch (err) {
     toast(err.message, 'err', 5000);
@@ -537,11 +676,11 @@ async function renderOutbox() {
   if (!items.length) { el.innerHTML = ''; return; }
   const bad = items.filter(i => i.error);
   el.innerHTML = `<div class="banner warn">
-      <span><strong>${items.length}</strong> survey${items.length > 1 ? 's' : ''} saved on this phone, waiting to upload.</span>
-      <button type="button" class="btn small" id="ob-sync">Upload now</button>
+      <span>${esc(t(items.length > 1 ? '{n} surveys saved on this phone, waiting to upload.' : '{n} survey saved on this phone, waiting to upload.', { n: items.length }))}</span>
+      <button type="button" class="btn small" id="ob-sync">${esc(t('Upload now'))}</button>
     </div>
-    ${bad.map(i => `<div class="banner err"><span>Rejected by server: ${esc(i.error)}</span>
-      <button type="button" class="btn small" data-discard="${i.id}">Discard</button></div>`).join('')}`;
+    ${bad.map(i => `<div class="banner err"><span>${esc(t('Rejected by server: {e}', { e: i.error }))}</span>
+      <button type="button" class="btn small" data-discard="${i.id}">${esc(t('Discard'))}</button></div>`).join('')}`;
   $('#ob-sync').onclick = () => sync();
-  $$('[data-discard]', el).forEach(b => (b.onclick = () => { if (confirm('Discard this survey permanently?')) discardOutbox(b.dataset.discard); }));
+  $$('[data-discard]', el).forEach(b => (b.onclick = () => { if (confirm(t('Discard this survey permanently?'))) discardOutbox(b.dataset.discard); }));
 }

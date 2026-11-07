@@ -1,5 +1,6 @@
 import { CONFIG } from './config.js';
 import { $, $$, esc, toast } from './util.js';
+import { t, getLang, setLang, applyLang } from './i18n.js';
 import { getSettings, saveSettings, isDemo, checkAuth, sync, pendingCount, bus } from './api.js';
 import { initSurvey } from './survey.js';
 import { initDashboard, showDashboard } from './dashboard.js';
@@ -19,6 +20,11 @@ function init() {
   route();
 
   $('#btn-settings').onclick = openSettings;
+  const langBtn = $('#btn-lang');
+  const paintLang = () => { langBtn.textContent = getLang() === 'hi' ? 'EN' : 'हिं'; applyLang(); updatePill(); };
+  langBtn.onclick = () => setLang(getLang() === 'hi' ? 'en' : 'hi');
+  window.addEventListener('langchange', paintLang);
+  paintLang();
   $('#sync-pill').onclick = () => sync();
   bus.addEventListener('outbox', updatePill);
   bus.addEventListener('sync', (e) => {
@@ -54,11 +60,11 @@ async function updatePill(detail) {
   if (detail?.state) syncing = detail.state === 'start';
   const n = await pendingCount();
   const p = $('#sync-pill');
-  let cls = 'ok', txt = 'Synced';
-  if (isDemo()) { cls = 'demo'; txt = 'Demo mode'; }
-  else if (syncing) { cls = 'busy'; txt = 'Uploading…'; }
-  else if (!navigator.onLine) { cls = 'off'; txt = n ? `Offline · ${n} pending` : 'Offline'; }
-  else if (n) { cls = 'warn'; txt = `${n} pending`; }
+  let cls = 'ok', txt = t('Synced');
+  if (isDemo()) { cls = 'demo'; txt = t('Demo mode'); }
+  else if (syncing) { cls = 'busy'; txt = t('Uploading…'); }
+  else if (!navigator.onLine) { cls = 'off'; txt = n ? t('Offline · {n} pending', { n }) : t('Offline'); }
+  else if (n) { cls = 'warn'; txt = t('{n} pending', { n }); }
   p.className = `pill-status ${cls}`;
   p.textContent = txt;
 }
@@ -68,19 +74,19 @@ function openSettings(firstRun = false) {
   const dlg = $('#settings-dlg');
   dlg.innerHTML = `
     <form method="dialog" id="set-form">
-      <div class="dlg-head"><h2>${firstRun ? 'Welcome — enter your name' : 'Settings'}</h2>
+      <div class="dlg-head"><h2>${esc(t(firstRun ? 'Welcome — enter your name' : 'Settings'))}</h2>
         ${firstRun ? '' : '<button type="button" class="btn small ghost" data-close aria-label="Close">✕</button>'}</div>
       <div class="dlg-body">
-        <label class="fld"><span>Surveyor name <b class="req">*</b></span><input id="set-name" required maxlength="100" value="${esc(s.name || '')}" autocomplete="name"></label>
+        <label class="fld"><span>${esc(t('Surveyor name'))} <b class="req">*</b></span><input id="set-name" required maxlength="100" value="${esc(s.name || '')}" autocomplete="name"></label>
         <label class="fld" ${CONFIG.API_BASE ? 'hidden' : ''}><span>Server URL <span class="opt">(Cloudflare Worker)</span></span>
           <input id="set-api" type="url" placeholder="${esc(CONFIG.API_BASE || 'https://line-survey-api.<account>.workers.dev')}" value="${esc(s.apiBase || '')}"></label>
-        <label class="fld"><span>Admin key <span class="opt">(only needed to delete surveys — leave empty otherwise)</span></span><input id="set-key" type="password" value="${esc(s.key || '')}" autocomplete="off"></label>
+        <label class="fld"><span>${esc(t('Admin key'))} <span class="opt">(only needed to delete or edit surveys — leave empty otherwise)</span></span><input id="set-key" type="password" value="${esc(s.key || '')}" autocomplete="off"></label>
         <p class="hint" id="set-mode">${(s.apiBase || CONFIG.API_BASE) ? '' : 'No server configured — the app runs in <b>Demo mode</b> and keeps surveys only on this device.'}</p>
         <p class="hint" id="set-msg"></p>
       </div>
       <div class="dlg-foot">
-        <button type="button" class="btn" id="set-test">Test connection</button><span class="spacer"></span>
-        <button type="submit" class="btn primary">Save</button>
+        <button type="button" class="btn" id="set-test">${esc(t('Test connection'))}</button><span class="spacer"></span>
+        <button type="submit" class="btn primary">${esc(t('Save'))}</button>
       </div>
     </form>`;
   dlg.showModal();
