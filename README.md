@@ -33,17 +33,21 @@ geotagged photographs, material requirements, a progress dashboard, and one-page
 1. First choose the line type, **11 kV line** or **33 kV line**. Photos stay locked until the line details are complete, and the last selection is remembered.
    * **11 kV:** Subdivision → Substation → Feeder (from the `SUBSTATION` sheet).
    * **33 kV:** Primary Substation → 33 kV Line → Section → Substation (from the `33KV` sheet). The Subdivision is filled in automatically from the chosen substation.
-2. Tick the irregularities. Items that depend on line voltage ask for 33 kV / 11 kV / LT:
+2. **Survey stretch (start / end point).** After the line details, enter the **start point** (typed location; GPS is captured automatically when you tap *Start survey from here*).
+   Line details are then locked and photos unlock. Record as many irregularities as you find along the stretch. When you reach the end, enter the **end point** and tap *End survey here*
+   (GPS captured automatically). The end point can be entered after the survey, even after closing the app or being offline: the open stretch is kept on the phone.
+   Every survey records which stretch it belongs to.
+3. Tick the irregularities. Items that depend on line voltage ask for 33 kV / 11 kV / LT:
    Tilted, Dilapidated, Rusted, Broken Pole · Sagged Line {33/11/LT} · House/Construction Under Line {33/11/LT} · Long Span Line ·
    Low Ground Clearance {33/11/LT} · Road/Canal/River Crossing · GI Wire Line {11/LT} · Too Many Joints In Span {33/11/LT} ·
    Damage AB Cable · Damage Pin Insulator {33/11} · Damage Disc {33/11} · Other (free text).
-3. Take **at least 2 photographs** (max 6) with the rear camera. **GPS is captured automatically** for every photo, and
+4. Take **at least 2 photographs** (max 6) with the rear camera. **GPS is captured automatically** for every photo, and
    feeder, lat/long ±accuracy, date-time and surveyor name are burnt into the photo itself.
-4. Enter **Location** and **Landmark** (Hindi is fine) plus optional remarks.
-5. **Material required?** Yes/No. If Yes, enter quantities:
+5. Enter **Location** and **Landmark** (Hindi is fine) plus optional remarks.
+6. **Material required?** Yes/No. If Yes, enter quantities:
    Pole (PCC 8.5/9/11 m, STP 9/11/13 m from the `POLE` sheet) in Nos, Conductor ACSR Weasel/Rabbit/Dog in metres,
    Pin Insulator 33/11 kV in Nos, Disc Insulator 33/11 kV in Nos, V Cross Arm 33/11 kV in Nos, LT AB Cable 1X16 / 3X50 / 3X95 / 3X120 sqmm in metres.
-6. **Submit.** Each survey gets a running number (`LS-00001`, …). **No network? No problem.** The survey is saved on the phone
+7. **Submit.** Each survey gets a running number (`LS-00001`, …). **No network? No problem.** The survey is saved on the phone
    and uploads automatically when the connection returns (the header shows "Offline · n pending").
 
 **Dashboard tab:** survey count, irregularities found, locations needing material, feeder coverage (x/75);
@@ -51,7 +55,8 @@ findings by irregularity (with voltage split); total material required; daily pr
 map of survey points; surveyor-wise count. Everything can be filtered by subdivision, substation, feeder and date.
 
 **Report tab:** filter by hierarchy, date, irregularity, material yes/no or free-text search. Then:
-* **PDF** on any row gives a single-survey, single-page PDF.
+* A **Survey stretches** list at the top shows every stretch with its start and end point (typed location + GPS map link), status (open / completed) and number of surveys. Admins can delete a stretch record.
+* **PDF** on any row gives a single-survey, single-page PDF. It includes the stretch start and end points.
 * **Select several (or Select all)** and click **Download PDF** to get one PDF with one page per survey.
   Each page has the details, irregularities, all photographs with GPS captions, the material table and a clickable Google Maps link.
 * **Export Excel (CSV)** gives one row per survey with one column per material item (selected rows only, or all rows if none are selected).
@@ -117,13 +122,16 @@ Open <http://localhost:8080>, then in ⚙ Settings use server `http://127.0.0.1:
 (Geolocation and the camera need `localhost` or HTTPS.)
 
 ## API reference (Worker)
-Everything is open to anyone with the link except deleting. `DELETE /api/surveys/:id` and `/api/admin/rebuild-index` need header `X-Access-Key: <ADMIN_KEY>`.
+Everything is open to anyone with the link except deleting. `DELETE /api/surveys/:id`, `DELETE /api/stretches/:id` and `/api/admin/rebuild-index` need header `X-Access-Key: <ADMIN_KEY>`.
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/health` | liveness |
 | GET | `/api/auth` | returns `{role: "surveyor" \| "admin"}` |
 | GET | `/api/surveys` | all survey records (JSON) |
+| POST | `/api/stretches` | JSON stretch record (line + start point, end point once finished). Create-or-update, idempotent on stretch `id` |
+| GET | `/api/stretches` | all stretch records |
+| DELETE | `/api/stretches/:id` | admin: delete a stretch record (surveys are kept) |
 | POST | `/api/surveys` | multipart: `data` (JSON) + `photo_0…photo_5` (JPEG). Idempotent on survey `id` |
 | GET | `/api/photo?key=photos/...jpg` | photo bytes |
 | DELETE | `/api/surveys/:id` | admin: delete a survey and its photos |
