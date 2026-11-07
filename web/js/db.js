@@ -3,21 +3,21 @@
 //   local  : surveys stored on this device in DEMO mode (no server configured)
 //   blobs  : photo blobs for demo mode
 //   kv     : misc cache (last downloaded survey list for offline viewing)
-//   stretchbox : survey stretches (start / end point) waiting to be uploaded
-//   localst    : survey stretches stored on this device in DEMO mode
-const DB_NAME = 'line-survey', VERSION = 2;
+// Survey stretches (start / end point) are kept in `kv` under the key prefixes `stretchbox:` (waiting to upload)
+// and `localst:` (demo mode), so the database layout never changes: no upgrade that an open old tab could block.
+const DB_NAME = 'line-survey';
 let dbp;
 
 function open() {
   if (dbp) return dbp;
   dbp = new Promise((res, rej) => {
-    const req = indexedDB.open(DB_NAME, VERSION);
+    const req = indexedDB.open(DB_NAME);   // no version: works with whatever layout already exists
     req.onupgradeneeded = () => {
       const db = req.result;
-      for (const s of ['outbox', 'local', 'stretchbox', 'localst']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
+      for (const s of ['outbox', 'local']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
       for (const s of ['blobs', 'kv']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
     };
-    req.onsuccess = () => res(req.result);
+    req.onsuccess = () => { const db = req.result; db.onversionchange = () => { db.close(); dbp = null; }; res(db); };
     req.onerror = () => rej(req.error);
   });
   return dbp;
@@ -35,7 +35,16 @@ async function tx(store, mode, fn) {
   });
 }
 
+const range = (name) => IDBKeyRange.bound(name + ':', name + ':\uffff');
 export const idb = {
+  /** A small keyed collection inside the `kv` store. */
+  coll: (name) => ({
+    put: (id, v) => tx('kv', 'readwrite', s => s.put(v, `${name}:${id}`)),
+    get: (id) => tx('kv', 'readonly', s => s.get(`${name}:${id}`)),
+    del: (id) => tx('kv', 'readwrite', s => s.delete(`${name}:${id}`)),
+    all: () => tx('kv', 'readonly', s => s.getAll(range(name))),
+    count: () => tx('kv', 'readonly', s => s.count(range(name))),
+  }),
   put: (store, value, key) => tx(store, 'readwrite', s => (key === undefined ? s.put(value) : s.put(value, key))),
   get: (store, key) => tx(store, 'readonly', s => s.get(key)),
   del: (store, key) => tx(store, 'readwrite', s => s.delete(key)),

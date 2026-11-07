@@ -27,7 +27,8 @@ self.addEventListener('fetch', (e) => {
   if (url.hostname.endsWith('tile.openstreetmap.org')) return;
   // network-first for our own files (fresh deploys), cache-first for CDN libs
   if (url.origin === location.origin) {
-    e.respondWith(fetch(req).then(res => {
+    // 'no-cache' = always check with the server (cheap 304 when unchanged), so a deploy never leaves a mix of old and new files
+    e.respondWith(fetch(req, { cache: 'no-cache' }).then(res => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: true }).then(r => r || caches.match('index.html'))));

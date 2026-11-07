@@ -2,6 +2,7 @@ import { CONFIG } from './config.js';
 import { idb } from './db.js';
 
 export const bus = new EventTarget();
+const stretchBox = idb.coll('stretchbox'), localSt = idb.coll('localst');
 const emit = (type, detail) => bus.dispatchEvent(new CustomEvent(type, { detail }));
 
 /* ---------------- settings ---------------- */
@@ -48,11 +49,11 @@ export const outboxItems = () => idb.all('outbox');
 
 /** Survey stretches (start / end points) are tiny JSON records: the latest state is queued and re-sent until the server has it. */
 export async function queueStretch(record) {
-  await idb.put('stretchbox', { id: record.id, record, queuedAt: new Date().toISOString() });
+  await stretchBox.put(record.id, { id: record.id, record, queuedAt: new Date().toISOString() });
   emit('outbox');
   sync();
 }
-export const pendingCount = async () => (await idb.count('outbox')) + (await idb.count('stretchbox'));
+export const pendingCount = async () => (await idb.count('outbox')) + (await stretchBox.count());
 
 let syncing = false;
 export async function sync() {
@@ -62,18 +63,18 @@ export async function sync() {
   let uploaded = 0, uploadedSt = 0, lastError = null;
   try {
     // stretches first, so a survey never reaches the server before the stretch it belongs to
-    for (const st of await idb.all('stretchbox')) {
+    for (const st of await stretchBox.all()) {
       try {
         if (isDemo()) await saveLocalStretch(st.record);
         else {
           if (!navigator.onLine) { lastError = 'Offline'; break; }
           await req('/api/stretches', { method: 'POST', body: JSON.stringify(st.record), headers: { 'Content-Type': 'application/json' } });
         }
-        await idb.del('stretchbox', st.id);
+        await stretchBox.del(st.id);
         uploadedSt++;
       } catch (err) {
         lastError = err.message;
-        if (err.status === 422) { await idb.del('stretchbox', st.id); continue; }   // can never be accepted
+        if (err.status === 422) { await stretchBox.del(st.id); continue; }   // can never be accepted
         break;
       }
     }
@@ -120,11 +121,11 @@ async function saveLocal(it) {
 }
 
 async function saveLocalStretch(rec) {
-  const old = await idb.get('localst', rec.id);
-  if (old) { if (!old.end && rec.end) { old.end = rec.end; await idb.put('localst', old); } return; }
-  const list = await idb.all('localst');
+  const old = await localSt.get(rec.id);
+  if (old) { if (!old.end && rec.end) { old.end = rec.end; await localSt.put(old.id, old); } return; }
+  const list = await localSt.all();
   const seq = list.reduce((m, r) => Math.max(m, r.seq || 0), 0) + 1;
-  await idb.put('localst', { ...structuredClone(rec), createdAt: new Date().toISOString(), seq, ref: 'ST-' + String(seq).padStart(5, '0') });
+  await localSt.put(rec.id, { ...structuredClone(rec), createdAt: new Date().toISOString(), seq, ref: 'ST-' + String(seq).padStart(5, '0') });
 }
 
 /* ---------------- read ---------------- */
@@ -155,7 +156,7 @@ let cachedStretches = null;
 export async function listStretches({ fresh = false } = {}) {
   if (cachedStretches && !fresh) return cachedStretches;
   try {
-    if (isDemo()) cachedStretches = (await idb.all('localst')).sort((a, b) => a.seq - b.seq);
+    if (isDemo()) cachedStretches = (await localSt.all()).sort((a, b) => a.seq - b.seq);
     else {
       cachedStretches = (await req('/api/stretches')).stretches;
       idb.put('kv', cachedStretches, 'stretches').catch(() => {});
@@ -166,7 +167,7 @@ export async function listStretches({ fresh = false } = {}) {
   return cachedStretches;
 }
 export async function deleteStretch(id) {
-  if (isDemo()) await idb.del('localst', id);
+  if (isDemo()) await localSt.del(id);
   else await req('/api/stretches/' + encodeURIComponent(id), { method: 'DELETE' });
   emit('data');
 }
