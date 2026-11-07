@@ -1,17 +1,20 @@
 import { CONFIG } from './config.js';
-import { MATERIALS, materialById, irregularityName, lineVoltageOf, linePath } from './catalog.js';
+import { MATERIALS, materialById, irregularityName, lineVoltageOf, linePath, lineTitle } from './catalog.js';
 import { $, $$, esc, toast, fmtDateTime, fmtDate, fmtLatLng, fmtNum, shortName, downloadBlob, blobToJpegDataURL, dayKey } from './util.js';
-import { listSurveys, getPhotoBlob, deleteSurvey, role, bus } from './api.js';
+import { listSurveys, listStretches, deleteStretch, getPhotoBlob, deleteSurvey, role, bus } from './api.js';
 import { filterBarHTML, wireFilterBar, applyFilters } from './filters.js';
 import { displayName } from './survey.js';
 
 let root, getF, all = [], view = [], selected = new Set(), limit = 100, busy = false;
+let stretches = [], stretchMap = new Map();
 
 export function initReport(el) {
   root = el;
   root.innerHTML = `
     <div class="view-head"><h1>Reports</h1><span id="rp-meta" class="muted"></span>
       <button class="btn small ghost" id="rp-refresh">Refresh</button></div>
+    <details class="card" id="rp-st"><summary><b>Survey stretches</b> <span class="muted" id="rp-st-n"></span></summary>
+      <div id="rp-st-list" class="st-list"></div></details>
     ${filterBarHTML('rp', { extra: true })}
     <div class="rp-tools card">
       <label class="chk"><input type="checkbox" id="rp-all"><span>Select all <b id="rp-count">0</b> shown</span></label>
@@ -28,6 +31,11 @@ export function initReport(el) {
   $('#rp-pdf').onclick = () => makePDF(all.filter(s => selected.has(s.id)));
   $('#rp-csv').onclick = exportCSV;
   $('#rp-list').addEventListener('click', onListClick);
+  $('#rp-st-list').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-delst]'); if (!b) return;
+    if (!confirm('Delete this survey stretch record? Surveys recorded in it are kept.')) return;
+    try { await deleteStretch(b.dataset.delst); toast('Stretch deleted', 'ok'); } catch (err) { toast(err.message, 'err'); }
+  });
   $('#rp-list').addEventListener('change', (e) => {
     const cb = e.target.closest('input[data-sel]'); if (!cb) return;
     cb.checked ? selected.add(cb.dataset.sel) : selected.delete(cb.dataset.sel);
@@ -41,14 +49,37 @@ export async function showReport() { await load(false); }
 async function load(fresh) {
   try {
     const r = await listSurveys({ fresh });
+    stretches = await listStretches({ fresh });
+    stretchMap = new Map(stretches.map(x => [x.id, x]));
     all = [...r.surveys].sort((a, b) => (b.seq || 0) - (a.seq || 0));
     $('#rp-meta').textContent = r.offline ? `Offline copy · ${fmtDate(r.at)}` : '';
     const ids = new Set(all.map(s => s.id));
     selected = new Set([...selected].filter(id => ids.has(id)));
+    renderStretches();
     render();
   } catch (err) {
     $('#rp-list').innerHTML = `<div class="empty err">${esc(err.message)}</div>`;
   }
+}
+
+const pointText = (p) => (p ? `${p.location} (${fmtLatLng(p.gps)})` : 'Not yet ended');
+const mapLink = (g) => `<a href="https://www.google.com/maps?q=${g.lat},${g.lng}" target="_blank" rel="noopener">${fmtLatLng(g)}</a>`;
+
+function renderStretches() {
+  const counts = {};
+  all.forEach(s => { if (s.stretchId) counts[s.stretchId] = (counts[s.stretchId] || 0) + 1; });
+  const list = [...stretches].sort((a, b) => (b.seq || 0) - (a.seq || 0));
+  const open = list.filter(x => !x.end).length;
+  $('#rp-st-n').textContent = list.length ? `(${list.length}${open ? `, ${open} open` : ''})` : '(none yet)';
+  $('#rp-st-list').innerHTML = list.map(x => `
+    <div class="st-item"><div class="st-main">
+      <b>${esc(x.ref)}</b> <b class="lv lv${lineVoltageOf(x) === '33 kV' ? '33' : '11'}">${lineVoltageOf(x)}</b> ${esc(lineTitle(x))}
+      ${x.end ? '' : '<span class="pill mat">Open</span>'}<br>
+      <span class="muted">${esc(x.surveyor?.name)} · ${counts[x.id] || 0} survey${counts[x.id] === 1 ? '' : 's'} · ${fmtDateTime(x.start.at)}</span><br>
+      <b>Start:</b> ${esc(x.start.location)} · ${mapLink(x.start.gps)}<br>
+      <b>End:</b> ${x.end ? `${esc(x.end.location)} · ${mapLink(x.end.gps)}` : '<span class="muted">not yet entered</span>'}
+    </div>${role() === 'admin' ? `<button class="btn small danger" data-delst="${x.id}">Delete</button>` : ''}</div>`).join('')
+    || '<div class="empty">No survey stretches yet.</div>';
 }
 
 function render() {
@@ -106,6 +137,10 @@ async function openDetail(s) {
         <dt>Subdivision</dt><dd>${esc(s.subdivision)}</dd>
         <dt>Substation</dt><dd>${esc(displayName(s.substation))}</dd>
         <dt>Feeder</dt><dd>${esc(displayName(s.feeder))}</dd>`}
+        ${stretchMap.get(s.stretchId) ? (() => { const x = stretchMap.get(s.stretchId); return `
+        <dt>Stretch</dt><dd>${esc(x.ref)}</dd>
+        <dt>Start point</dt><dd>${esc(x.start.location)} · ${mapLink(x.start.gps)}</dd>
+        <dt>End point</dt><dd>${x.end ? `${esc(x.end.location)} · ${mapLink(x.end.gps)}` : 'Not yet ended'}</dd>`; })() : ''}
         <dt>Captured</dt><dd>${fmtDateTime(s.capturedAt)}</dd>
         <dt>Location</dt><dd>${esc(s.location)}</dd>
         <dt>Landmark</dt><dd>${esc(s.landmark)}</dd>
@@ -148,13 +183,16 @@ function exportCSV() {
   const rows = view.filter(s => !selected.size || selected.has(s.id));
   const head = ['Ref', 'Survey ID', 'Captured At', 'Submitted At', 'Line Type', 'Primary Substation', '33 kV Line', 'Section', 'Subdivision', 'Substation', 'Feeder', 'Irregularities',
     'Location', 'Landmark', 'Remarks', 'Latitude', 'Longitude', 'GPS Accuracy (m)', 'Surveyor', 'Material Required',
-    ...MATERIALS.map(m => `${m.item} (${m.unit === 'm' ? 'm' : 'Nos'})`), 'Photos', 'Google Maps'];
+    ...MATERIALS.map(m => `${m.item} (${m.unit === 'm' ? 'm' : 'Nos'})`), 'Photos', 'Google Maps',
+    'Stretch Ref', 'Stretch Start Location', 'Stretch Start Lat', 'Stretch Start Lng', 'Stretch End Location', 'Stretch End Lat', 'Stretch End Lng'];
   const lines = [head, ...rows.map(s => {
     const q = Object.fromEntries((s.materials || []).map(m => [m.id, m.qty]));
     return [s.ref, s.id, fmtDateTime(s.capturedAt), fmtDateTime(s.createdAt), lineVoltageOf(s), s.primarySubstation || '', s.line33 || '', s.section || '', s.subdivision, s.substation, s.feeder,
       s.irregularities.map(irregularityName).join('; '), s.location, s.landmark, s.remarks || '',
       s.gps?.lat, s.gps?.lng, Math.round(s.gps?.acc || 0), s.surveyor?.name, s.materialRequired ? 'Yes' : 'No',
-      ...MATERIALS.map(m => q[m.id] || ''), s.photos.length, `https://www.google.com/maps?q=${s.gps?.lat},${s.gps?.lng}`];
+      ...MATERIALS.map(m => q[m.id] || ''), s.photos.length, `https://www.google.com/maps?q=${s.gps?.lat},${s.gps?.lng}`,
+      ...(x => [x?.ref || '', x?.start.location || '', x?.start.gps.lat ?? '', x?.start.gps.lng ?? '',
+        x?.end?.location || '', x?.end?.gps.lat ?? '', x?.end?.gps.lng ?? ''])(stretchMap.get(s.stretchId))];
   })];
   const csv = lines.map(r => r.map(v => { const t = String(v ?? ''); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; }).join(',')).join('\r\n');
   downloadBlob(new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8' }), `Line_Survey_${dayKey(new Date().toISOString())}_${rows.length}.csv`);
@@ -242,6 +280,13 @@ async function drawPage(doc, s, pageNo, pageCount) {
   row2('Landmark', s.landmark, 'GPS (lat, long)', `${fmtLatLng(s.gps)}  ±${Math.round(s.gps?.acc || 0)} m`);
   // map link over GPS cell
   doc.link(M + half, y - 10, half, 10, { url: `https://www.google.com/maps?q=${s.gps?.lat},${s.gps?.lng}` });
+  const sx = stretchMap.get(s.stretchId);
+  if (sx) {
+    const startY = y;
+    row2(`Stretch start point (${sx.ref})`, pointText(sx.start), 'Stretch end point', pointText(sx.end));
+    doc.link(M, startY, half, y - startY, { url: `https://www.google.com/maps?q=${sx.start.gps.lat},${sx.start.gps.lng}` });
+    if (sx.end) doc.link(M + half, startY, half, y - startY, { url: `https://www.google.com/maps?q=${sx.end.gps.lat},${sx.end.gps.lng}` });
+  }
 
   // Irregularities
   y += 5;

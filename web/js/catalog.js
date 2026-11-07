@@ -73,12 +73,9 @@ export const linePath = (s) => (lineVoltageOf(s) === '33 kV'
 export const MIN_PHOTOS = 2;
 export const MAX_PHOTOS = 6;
 
-/** Validate a survey record. Returns an array of error strings (empty = OK). */
-export function validateSurvey(s, HIERARCHY, LINES = LINES33) {
+/** Errors in the line-selection fields shared by surveys and stretches (11 kV chain or 33 kV chain). */
+function lineErrors(s, HIERARCHY, LINES) {
   const e = [];
-  const str = (v, max = 500) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
-  if (!s || typeof s !== 'object') return ['Invalid payload'];
-  if (!/^[A-Za-z0-9-]{8,64}$/.test(s.id || '')) e.push('Invalid survey id');
   if (s.lineVoltage !== undefined && !LINE_TYPES.includes(s.lineVoltage)) e.push('Choose 11 kV or 33 kV line');
   else if (lineVoltageOf(s) === '33 kV') {
     const secs = LINES[s.primarySubstation]?.[s.line33];
@@ -90,6 +87,19 @@ export function validateSurvey(s, HIERARCHY, LINES = LINES33) {
   } else if (!HIERARCHY[s.subdivision]) e.push('Select a valid Subdivision');
   else if (!HIERARCHY[s.subdivision][s.substation]) e.push('Select a valid Substation');
   else if (!HIERARCHY[s.subdivision][s.substation].includes(s.feeder)) e.push('Select a valid Feeder');
+  return e;
+}
+
+const ID_RE = /^[A-Za-z0-9-]{8,64}$/;
+
+/** Validate a survey record. Returns an array of error strings (empty = OK). */
+export function validateSurvey(s, HIERARCHY, LINES = LINES33) {
+  const e = [];
+  const str = (v, max = 500) => typeof v === 'string' && v.trim().length > 0 && v.length <= max;
+  if (!s || typeof s !== 'object') return ['Invalid payload'];
+  if (!ID_RE.test(s.id || '')) e.push('Invalid survey id');
+  if (s.stretchId !== undefined && s.stretchId !== null && !ID_RE.test(s.stretchId)) e.push('Invalid stretch id');
+  e.push(...lineErrors(s, HIERARCHY, LINES));
   if (!Array.isArray(s.irregularities) || !s.irregularities.length) e.push('Select at least one irregularity');
   else for (const it of s.irregularities) {
     const def = IRREGULARITIES.find(d => d.code === it.code);
@@ -110,5 +120,27 @@ export function validateSurvey(s, HIERARCHY, LINES = LINES33) {
     }
   }
   if (!s.surveyor || !str(s.surveyor.name, 100)) e.push('Surveyor name missing (open Settings)');
+  return e;
+}
+
+/* ---------------- survey stretch (sub-section of a line: start point -> end point) ---------------- */
+/** A start / end point: typed location + auto-captured GPS. */
+function pointErrors(p, label) {
+  if (!p || typeof p !== 'object') return [`${label} point is missing`];
+  const e = [];
+  if (typeof p.location !== 'string' || !p.location.trim() || p.location.length > 500) e.push(`${label} point: enter the location`);
+  if (!p.gps || typeof p.gps.lat !== 'number' || typeof p.gps.lng !== 'number') e.push(`${label} point: GPS location missing`);
+  return e;
+}
+
+/** Validate a stretch record: line details + start point (required) + end point (optional until the survey is finished). */
+export function validateStretch(s, HIERARCHY, LINES = LINES33) {
+  if (!s || typeof s !== 'object') return ['Invalid payload'];
+  const e = [];
+  if (!ID_RE.test(s.id || '')) e.push('Invalid stretch id');
+  e.push(...lineErrors(s, HIERARCHY, LINES));
+  e.push(...pointErrors(s.start, 'Start'));
+  if (s.end !== undefined && s.end !== null) e.push(...pointErrors(s.end, 'End'));
+  if (!s.surveyor || typeof s.surveyor.name !== 'string' || !s.surveyor.name.trim()) e.push('Surveyor name missing (open Settings)');
   return e;
 }

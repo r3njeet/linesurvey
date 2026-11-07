@@ -3,7 +3,9 @@
 //   local  : surveys stored on this device in DEMO mode (no server configured)
 //   blobs  : photo blobs for demo mode
 //   kv     : misc cache (last downloaded survey list for offline viewing)
-const DB_NAME = 'line-survey', VERSION = 1;
+//   stretchbox : survey stretches (start / end point) waiting to be uploaded
+//   localst    : survey stretches stored on this device in DEMO mode
+const DB_NAME = 'line-survey', VERSION = 2;
 let dbp;
 
 function open() {
@@ -12,7 +14,7 @@ function open() {
     const req = indexedDB.open(DB_NAME, VERSION);
     req.onupgradeneeded = () => {
       const db = req.result;
-      for (const s of ['outbox', 'local']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
+      for (const s of ['outbox', 'local', 'stretchbox', 'localst']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: 'id' });
       for (const s of ['blobs', 'kv']) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s);
     };
     req.onsuccess = () => res(req.result);

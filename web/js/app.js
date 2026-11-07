@@ -1,6 +1,6 @@
 import { CONFIG } from './config.js';
 import { $, $$, esc, toast } from './util.js';
-import { getSettings, saveSettings, isDemo, checkAuth, sync, outboxItems, bus } from './api.js';
+import { getSettings, saveSettings, isDemo, checkAuth, sync, pendingCount, bus } from './api.js';
 import { initSurvey } from './survey.js';
 import { initDashboard, showDashboard } from './dashboard.js';
 import { initReport, showReport } from './report.js';
@@ -28,7 +28,7 @@ function init() {
   });
   window.addEventListener('online', () => { updatePill(); sync(); });
   window.addEventListener('offline', updatePill);
-  setInterval(async () => { if ((await outboxItems()).length && navigator.onLine) sync(); }, 60000);
+  setInterval(async () => { if ((await pendingCount()) && navigator.onLine) sync(); }, 60000);
   updatePill();
   sync();
 
@@ -52,7 +52,7 @@ function route() {
 let syncing = false;
 async function updatePill(detail) {
   if (detail?.state) syncing = detail.state === 'start';
-  const n = (await outboxItems()).length;
+  const n = await pendingCount();
   const p = $('#sync-pill');
   let cls = 'ok', txt = 'Synced';
   if (isDemo()) { cls = 'demo'; txt = 'Demo mode'; }

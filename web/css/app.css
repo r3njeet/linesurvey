@@ -253,3 +253,20 @@ td .prog { display: inline-block; width: 90px; vertical-align: middle; margin-ri
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
 .toast.ok { background: var(--ok); color: #fff; } .toast.err { background: var(--err); color: #fff; }
 @media (min-width: 900px) { .toast { bottom: 24px; } }
+
+/* survey stretch (start / end point) */
+fieldset.plain { border: 0; padding: 0; margin: 0; min-width: 0; }
+fieldset.plain:disabled { opacity: .72; }
+.lock-note { color: var(--muted); font-size: 13px; margin: 10px 0 0; }
+.sx-open { border: 1.5px solid var(--ok); background: var(--ok-bg); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; }
+.sx-pt b { display: block; font-size: 11.5px; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); }
+.sx-pt span { display: block; font-weight: 700; overflow-wrap: anywhere; }
+.sx-pt small { display: block; color: var(--muted); margin-top: 2px; }
+.sx-meta { margin-top: 8px; font-size: 13px; font-weight: 700; color: var(--ok); }
+#sx-state.good { color: var(--ok); }
+input[readonly] { background: var(--line-2); outline: none; }
+.st-list .st-item { border-top: 1px solid var(--line-2); padding: 9px 0; display: flex; gap: 10px; align-items: flex-start; }
+.st-list .st-item:first-child { border-top: 0; }
+.st-list .st-main { flex: 1; min-width: 0; font-size: 13.5px; overflow-wrap: anywhere; }
+.st-list .st-main b { font-size: 14px; }
+#rp-st summary { cursor: pointer; list-style-position: inside; } #rp-st[open] summary { margin-bottom: 8px; }

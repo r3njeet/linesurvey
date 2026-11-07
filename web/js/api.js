@@ -46,14 +46,38 @@ export async function queueSurvey(record, photoBlobs) {
 }
 export const outboxItems = () => idb.all('outbox');
 
+/** Survey stretches (start / end points) are tiny JSON records: the latest state is queued and re-sent until the server has it. */
+export async function queueStretch(record) {
+  await idb.put('stretchbox', { id: record.id, record, queuedAt: new Date().toISOString() });
+  emit('outbox');
+  sync();
+}
+export const pendingCount = async () => (await idb.count('outbox')) + (await idb.count('stretchbox'));
+
 let syncing = false;
 export async function sync() {
   if (syncing) return;
   syncing = true;
   emit('sync', { state: 'start' });
-  let uploaded = 0, lastError = null;
+  let uploaded = 0, uploadedSt = 0, lastError = null;
   try {
-    const items = (await idb.all('outbox')).sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
+    // stretches first, so a survey never reaches the server before the stretch it belongs to
+    for (const st of await idb.all('stretchbox')) {
+      try {
+        if (isDemo()) await saveLocalStretch(st.record);
+        else {
+          if (!navigator.onLine) { lastError = 'Offline'; break; }
+          await req('/api/stretches', { method: 'POST', body: JSON.stringify(st.record), headers: { 'Content-Type': 'application/json' } });
+        }
+        await idb.del('stretchbox', st.id);
+        uploadedSt++;
+      } catch (err) {
+        lastError = err.message;
+        if (err.status === 422) { await idb.del('stretchbox', st.id); continue; }   // can never be accepted
+        break;
+      }
+    }
+    const items = lastError ? [] : (await idb.all('outbox')).sort((a, b) => a.queuedAt.localeCompare(b.queuedAt));
     for (const it of items) {
       try {
         if (isDemo()) await saveLocal(it);
@@ -76,7 +100,7 @@ export async function sync() {
     syncing = false;
     emit('outbox');
     emit('sync', { state: 'done', uploaded, error: lastError });
-    if (uploaded) emit('data');
+    if (uploaded || uploadedSt) emit('data');
   }
 }
 export async function discardOutbox(id) { await idb.del('outbox', id); emit('outbox'); }
@@ -93,6 +117,14 @@ async function saveLocal(it) {
   rec.photos = rec.photos.map((p, i) => ({ ...p, key: `demo/${rec.id}/${i + 1}.jpg` }));
   for (let i = 0; i < it.photos.length; i++) await idb.put('blobs', it.photos[i], rec.photos[i].key);
   await idb.put('local', rec);
+}
+
+async function saveLocalStretch(rec) {
+  const old = await idb.get('localst', rec.id);
+  if (old) { if (!old.end && rec.end) { old.end = rec.end; await idb.put('localst', old); } return; }
+  const list = await idb.all('localst');
+  const seq = list.reduce((m, r) => Math.max(m, r.seq || 0), 0) + 1;
+  await idb.put('localst', { ...structuredClone(rec), createdAt: new Date().toISOString(), seq, ref: 'ST-' + String(seq).padStart(5, '0') });
 }
 
 /* ---------------- read ---------------- */
@@ -115,8 +147,29 @@ export async function listSurveys({ fresh = false } = {}) {
   }
   return cachedList;
 }
-bus.addEventListener('data', () => { cachedList = null; });
-bus.addEventListener('settings', () => { cachedList = null; });
+bus.addEventListener('data', () => { cachedList = null; cachedStretches = null; });
+bus.addEventListener('settings', () => { cachedList = null; cachedStretches = null; });
+
+let cachedStretches = null;
+/** All survey stretches. Never throws: reports still work (without start / end points) if this fails. */
+export async function listStretches({ fresh = false } = {}) {
+  if (cachedStretches && !fresh) return cachedStretches;
+  try {
+    if (isDemo()) cachedStretches = (await idb.all('localst')).sort((a, b) => a.seq - b.seq);
+    else {
+      cachedStretches = (await req('/api/stretches')).stretches;
+      idb.put('kv', cachedStretches, 'stretches').catch(() => {});
+    }
+  } catch {
+    cachedStretches = (await idb.get('kv', 'stretches').catch(() => null)) || [];
+  }
+  return cachedStretches;
+}
+export async function deleteStretch(id) {
+  if (isDemo()) await idb.del('localst', id);
+  else await req('/api/stretches/' + encodeURIComponent(id), { method: 'DELETE' });
+  emit('data');
+}
 
 const photoCache = new Map();
 export async function getPhotoBlob(key) {

@@ -5,6 +5,8 @@
  *   photos/<YYYY-MM>/<surveyId>/<n>.jpg   geotagged photographs
  *   surveys/<surveyId>.json               one JSON record per survey (source of truth)
  *   index/surveys.json                    array of all records (fast listing for dashboard/report)
+ *   stretches/<stretchId>.json            a survey stretch: line + start point (+ end point once finished)
+ *   index/stretches.json                  array of all stretches
  *
  * The index is updated with optimistic concurrency (R2 conditional put on ETag),
  * so simultaneous submissions from many surveyors never overwrite each other.
@@ -16,9 +18,14 @@
  *   ALLOWED_ORIGINS  comma separated origins allowed by CORS, or "*"
  */
 import { HIERARCHY } from '../../web/js/masters.js';
-import { validateSurvey, MIN_PHOTOS, MAX_PHOTOS } from '../../web/js/catalog.js';
+import { validateSurvey, validateStretch, MIN_PHOTOS, MAX_PHOTOS } from '../../web/js/catalog.js';
 
 const INDEX_KEY = 'index/surveys.json';
+// Two kinds of records share the same storage pattern: one JSON file per record + one combined index.
+const KINDS = {
+  surveys:   { prefix: 'surveys/',   index: INDEX_KEY },
+  stretches: { prefix: 'stretches/', index: 'index/stretches.json' },
+};
 const MAX_PHOTO_BYTES = 6 * 1024 * 1024;
 
 export default {
@@ -58,6 +65,18 @@ async function route(request, env) {
     return json({ ok: true, surveys: list }, 200, { 'Cache-Control': 'no-store' });
   }
 
+  if (p === '/api/stretches' && m === 'POST') return saveStretch(request, env);
+  if (p === '/api/stretches' && m === 'GET') {
+    const obj = await env.BUCKET.get(KINDS.stretches.index);
+    const list = obj ? await obj.json() : await buildIndexFromRecords(env, 'stretches');
+    return json({ ok: true, stretches: list }, 200, { 'Cache-Control': 'no-store' });
+  }
+  const delSt = p.match(/^\/api\/stretches\/([A-Za-z0-9-]{8,64})$/);
+  if (delSt && m === 'DELETE') {
+    if (role !== 'admin') throw httpError(403, 'Only admin can do this');
+    return deleteStretch(delSt[1], env);
+  }
+
   if (p === '/api/photo' && m === 'GET') {
     const key = url.searchParams.get('key') || '';
     if (!/^photos\/[0-9]{4}-[0-9]{2}\/[A-Za-z0-9-]+\/[0-9]+\.jpg$/.test(key)) throw httpError(400, 'Bad photo key');
@@ -76,9 +95,13 @@ async function route(request, env) {
 
   if (p === '/api/admin/rebuild-index' && m === 'POST') {
     if (role !== 'admin') throw httpError(403, 'Only admin can do this');
-    const list = await buildIndexFromRecords(env);
-    await env.BUCKET.put(INDEX_KEY, JSON.stringify(list), { httpMetadata: { contentType: 'application/json' } });
-    return json({ ok: true, count: list.length });
+    const out = {};
+    for (const kind of Object.keys(KINDS)) {
+      const list = await buildIndexFromRecords(env, kind);
+      await env.BUCKET.put(KINDS[kind].index, JSON.stringify(list), { httpMetadata: { contentType: 'application/json' } });
+      out[kind] = list.length;
+    }
+    return json({ ok: true, count: out.surveys, ...out });
   }
 
   throw httpError(404, 'Not found');
@@ -140,6 +163,7 @@ async function submitSurvey(request, env) {
 function sanitize(s, photos, now) {
   return {
     id: s.id,
+    ...(s.stretchId ? { stretchId: s.stretchId } : {}),
     createdAt: now.toISOString(),
     capturedAt: str(s.capturedAt, 40) || now.toISOString(),
     surveyor: { name: str(s.surveyor?.name, 100) },
@@ -157,6 +181,63 @@ function sanitize(s, photos, now) {
   };
 }
 
+/* ---------------- survey stretches ---------------- */
+/**
+ * Create-or-update. The client sends the whole record, first when the stretch is started (no end point)
+ * and again when it is ended. The start point is fixed by the first save; the end point is accepted once.
+ */
+async function saveStretch(request, env) {
+  let s;
+  try { s = await request.json(); } catch { throw httpError(400, 'Invalid JSON'); }
+  const errors = validateStretch(s, HIERARCHY);
+  if (errors.length) return json({ ok: false, error: errors.join('; '), errors }, 422);
+
+  const now = new Date();
+  let saved, created = false;
+  await updateIndex(env, (list) => {
+    const i = list.findIndex(r => r.id === s.id);
+    if (i >= 0) {
+      const old = list[i];
+      if (!old.end && s.end) old.end = cleanPoint(s.end, now);          // finish an open stretch
+      saved = old;
+      return list;
+    }
+    created = true;
+    const seq = list.reduce((mx, r) => Math.max(mx, r.seq || 0), 0) + 1;
+    saved = {
+      id: s.id, seq, ref: 'ST-' + String(seq).padStart(5, '0'),
+      createdAt: now.toISOString(),
+      surveyor: { name: str(s.surveyor?.name, 100) },
+      lineVoltage: s.lineVoltage === '33 kV' ? '33 kV' : '11 kV',
+      subdivision: s.subdivision, substation: s.substation,
+      feeder: s.lineVoltage === '33 kV' ? '' : s.feeder,
+      ...(s.lineVoltage === '33 kV' ? { primarySubstation: s.primarySubstation, line33: s.line33, section: s.section } : {}),
+      start: cleanPoint(s.start, now),
+      end: s.end ? cleanPoint(s.end, now) : null,
+    };
+    list.push(saved);
+    return list;
+  }, 'stretches');
+  await env.BUCKET.put(`stretches/${saved.id}.json`, JSON.stringify(saved), { httpMetadata: { contentType: 'application/json' } });
+  return json({ ok: true, stretch: saved }, created ? 201 : 200);
+}
+
+function cleanPoint(p, now) {
+  return {
+    location: str(p.location, 500),
+    gps: { lat: num(p.gps.lat), lng: num(p.gps.lng), acc: num(p.gps.acc) },
+    at: str(p.at, 40) || now.toISOString(),
+  };
+}
+
+async function deleteStretch(id, env) {
+  let found = false;
+  await updateIndex(env, (list) => { found = list.some(r => r.id === id); return list.filter(r => r.id !== id); }, 'stretches');
+  if (!found) throw httpError(404, 'Stretch not found');
+  await env.BUCKET.delete(`stretches/${id}.json`);
+  return json({ ok: true, deleted: id });
+}
+
 /* ---------------- delete ---------------- */
 async function deleteSurvey(id, env) {
   const obj = await env.BUCKET.get(`surveys/${id}.json`);
@@ -172,25 +253,26 @@ async function deleteSurvey(id, env) {
 }
 
 /* ---------------- index helpers ---------------- */
-async function updateIndex(env, mutate) {
+async function updateIndex(env, mutate, kind = 'surveys') {
+  const key = KINDS[kind].index;
   for (let attempt = 0; attempt < 12; attempt++) {
-    const obj = await env.BUCKET.get(INDEX_KEY);
-    const list = obj ? await obj.json() : await buildIndexFromRecords(env);
+    const obj = await env.BUCKET.get(key);
+    const list = obj ? await obj.json() : await buildIndexFromRecords(env, kind);
     const next = mutate(list);
     const opts = { httpMetadata: { contentType: 'application/json' } };
     if (obj) opts.onlyIf = { etagMatches: obj.etag };
-    const res = await env.BUCKET.put(INDEX_KEY, JSON.stringify(next), opts);
+    const res = await env.BUCKET.put(key, JSON.stringify(next), opts);
     if (res) return next;                       // null => someone else wrote first; retry
     await new Promise(r => setTimeout(r, 40 + Math.random() * 120 * (attempt + 1)));
   }
   throw httpError(503, 'Server busy, please retry');
 }
 
-async function buildIndexFromRecords(env) {
+async function buildIndexFromRecords(env, kind = 'surveys') {
   const list = [];
   let cursor;
   do {
-    const page = await env.BUCKET.list({ prefix: 'surveys/', cursor, limit: 1000 });
+    const page = await env.BUCKET.list({ prefix: KINDS[kind].prefix, cursor, limit: 1000 });
     const recs = await Promise.all(page.objects.map(o => env.BUCKET.get(o.key).then(r => r && r.json())));
     list.push(...recs.filter(Boolean));
     cursor = page.truncated ? page.cursor : undefined;
